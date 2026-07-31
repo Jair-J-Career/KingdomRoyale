@@ -4,10 +4,12 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local CurrentGameState = ReplicatedStorage:WaitForChild("CurrentGameState")
 local RoleAssigned = ReplicatedStorage:WaitForChild("RoleAssigned")
+local ExecutionPrompt = ReplicatedStorage:WaitForChild("ExecutionPrompt")
 
 local SharedState = require(ReplicatedStorage.Shared.GameState)
 local GameState = SharedState.GameState
 local PlayerData = SharedState.PlayerData
+local PendingActions = GameState.PendingActions
 
 local STATE_DISPLAY_NAMES = {
 	WaitingForPlayers = "Waiting for Players",
@@ -52,24 +54,39 @@ local function assignRoles()
 	local availableRoles = table.clone(ROLES)
 
 	-- Test rig: force Player1 to King so role-specific flows can be tested solo.
-	local riggedPlayer = Players:FindFirstChild("Player1")
-	if riggedPlayer then
-		PlayerData[riggedPlayer.UserId] = {
+	local kingRig = Players:FindFirstChild("Player1")
+	if kingRig then
+		PlayerData[kingRig.UserId] = {
 			Role = "King",
+			IsAlive = true,
 		}
-		print(riggedPlayer.Name .. " has been assigned the role of King")
-		RoleAssigned:FireClient(riggedPlayer, "King")
+		print(kingRig.Name .. " has been assigned the role of King")
+		RoleAssigned:FireClient(kingRig, "King")
 
 		table.remove(availableRoles, table.find(availableRoles, "King"))
+	end
+
+	-- Test rig: force Player2 to Sorcerer so the executioner flow can be tested alongside the King.
+	local sorcererRig = Players:FindFirstChild("Player2")
+	if sorcererRig then
+		PlayerData[sorcererRig.UserId] = {
+			Role = "Sorcerer",
+			IsAlive = true,
+		}
+		print(sorcererRig.Name .. " has been assigned the role of Sorcerer")
+		RoleAssigned:FireClient(sorcererRig, "Sorcerer")
+
+		table.remove(availableRoles, table.find(availableRoles, "Sorcerer"))
 	end
 
 	shuffle(availableRoles)
 
 	for _, player in Players:GetPlayers() do
-		if player ~= riggedPlayer then
+		if player ~= kingRig and player ~= sorcererRig then
 			local role = table.remove(availableRoles, 1)
 			PlayerData[player.UserId] = {
 				Role = role,
+				IsAlive = true,
 			}
 			print(player.Name .. " has been assigned the role of " .. role)
 			RoleAssigned:FireClient(player, role)
@@ -89,6 +106,32 @@ local function teleportPlayersTo(spawnPart: BasePart)
 	for _, player in Players:GetPlayers() do
 		teleportPlayerTo(player, spawnPart.CFrame)
 	end
+end
+
+local function notifyExecutioners()
+	print("Entering Night Phase. Checking PendingActions...")
+
+	local targetName
+	for _, action in PendingActions do
+		if action.ActionType == "OrderMurder" then
+			targetName = action.Target
+			break
+		end
+	end
+
+	if not targetName then
+		return
+	end
+
+	for _, player in Players:GetPlayers() do
+		local data = PlayerData[player.UserId]
+		if data and (data.Role == "Sorcerer" or data.Role == "Knight") then
+			print("Sending ExecutionPrompt to: ", player.Name, " for target: ", targetName)
+			ExecutionPrompt:FireClient(player, targetName)
+		end
+	end
+
+	table.clear(PendingActions)
 end
 
 local function runSecretMeetings()
@@ -117,7 +160,14 @@ end
 updateGameStateDisplay()
 
 while true do
-	task.wait(5)
+	if GameState.CurrentState == "WaitingForPlayers" then
+		repeat
+			task.wait(1)
+		until #Players:GetPlayers() >= 3
+	else
+		task.wait(5)
+	end
+
 	print(GameState.CurrentState, GameState.CurrentDay)
 
 	if GameState.CurrentState == "WaitingForPlayers" then
@@ -133,6 +183,7 @@ while true do
 	elseif GameState.CurrentState == "EveningGathering" then
 		GameState.CurrentState = "NightPhase"
 		teleportPlayersTo(Workspace.PrivateQuarters.SpawnPoint_Private)
+		notifyExecutioners()
 	elseif GameState.CurrentState == "NightPhase" then
 		if GameState.CurrentDay == 6 then
 			GameState.CurrentState = "GameOver"

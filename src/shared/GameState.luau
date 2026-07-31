@@ -1,6 +1,7 @@
 local GameState = {
 	CurrentState = "WaitingForPlayers",
 	CurrentDay = 1,
+	PendingActions = {},
 }
 
 local PlayerData = {}

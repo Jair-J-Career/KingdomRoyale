@@ -18,6 +18,12 @@
       },
       "ActionRequest": {
         "$className": "RemoteEvent"
+      },
+      "ExecutionPrompt": {
+        "$className": "RemoteEvent"
+      },
+      "GetMyRole": {
+        "$className": "RemoteFunction"
       }
     },
 

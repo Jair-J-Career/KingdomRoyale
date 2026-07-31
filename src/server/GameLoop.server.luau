@@ -5,6 +5,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CurrentGameState = ReplicatedStorage:WaitForChild("CurrentGameState")
 local RoleAssigned = ReplicatedStorage:WaitForChild("RoleAssigned")
 local ExecutionPrompt = ReplicatedStorage:WaitForChild("ExecutionPrompt")
+local AliveStatusUpdate = ReplicatedStorage:WaitForChild("AliveStatusUpdate")
 
 local SharedState = require(ReplicatedStorage.Shared.GameState)
 local GameState = SharedState.GameState
@@ -50,48 +51,59 @@ local function shuffle(array)
 	end
 end
 
+-- Test rig: the first three players (sorted by name) are forced into fixed roles
+-- so the King -> Executioner -> Revolutionary flows can all be tested together.
+local TEST_RIG_ROLES = { "King", "Sorcerer", "Revolutionary" }
+
+local function broadcastAliveStatus()
+	local snapshot = {}
+	for _, player in Players:GetPlayers() do
+		local data = PlayerData[player.UserId]
+		table.insert(snapshot, {
+			UserId = player.UserId,
+			Name = player.Name,
+			IsAlive = data ~= nil and data.IsAlive == true,
+		})
+	end
+	AliveStatusUpdate:FireAllClients(snapshot)
+end
+
 local function assignRoles()
 	local availableRoles = table.clone(ROLES)
 
-	-- Test rig: force Player1 to King so role-specific flows can be tested solo.
-	local kingRig = Players:FindFirstChild("Player1")
-	if kingRig then
-		PlayerData[kingRig.UserId] = {
-			Role = "King",
-			IsAlive = true,
-		}
-		print(kingRig.Name .. " has been assigned the role of King")
-		RoleAssigned:FireClient(kingRig, "King")
+	local players = Players:GetPlayers()
+	table.sort(players, function(a, b)
+		return a.Name < b.Name
+	end)
 
-		table.remove(availableRoles, table.find(availableRoles, "King"))
-	end
-
-	-- Test rig: force Player2 to Sorcerer so the executioner flow can be tested alongside the King.
-	local sorcererRig = Players:FindFirstChild("Player2")
-	if sorcererRig then
-		PlayerData[sorcererRig.UserId] = {
-			Role = "Sorcerer",
-			IsAlive = true,
-		}
-		print(sorcererRig.Name .. " has been assigned the role of Sorcerer")
-		RoleAssigned:FireClient(sorcererRig, "Sorcerer")
-
-		table.remove(availableRoles, table.find(availableRoles, "Sorcerer"))
-	end
-
-	shuffle(availableRoles)
-
-	for _, player in Players:GetPlayers() do
-		if player ~= kingRig and player ~= sorcererRig then
-			local role = table.remove(availableRoles, 1)
+	for i, role in TEST_RIG_ROLES do
+		local player = players[i]
+		if player then
 			PlayerData[player.UserId] = {
 				Role = role,
 				IsAlive = true,
 			}
 			print(player.Name .. " has been assigned the role of " .. role)
 			RoleAssigned:FireClient(player, role)
+
+			table.remove(availableRoles, table.find(availableRoles, role))
 		end
 	end
+
+	shuffle(availableRoles)
+
+	for i = #TEST_RIG_ROLES + 1, #players do
+		local player = players[i]
+		local role = table.remove(availableRoles, 1)
+		PlayerData[player.UserId] = {
+			Role = role,
+			IsAlive = true,
+		}
+		print(player.Name .. " has been assigned the role of " .. role)
+		RoleAssigned:FireClient(player, role)
+	end
+
+	broadcastAliveStatus()
 end
 
 local function teleportPlayerTo(player: Player, cframe: CFrame)
@@ -102,11 +114,50 @@ local function teleportPlayerTo(player: Player, cframe: CFrame)
 	end
 end
 
+local function isAlive(player: Player): boolean
+	local data = PlayerData[player.UserId]
+	return data ~= nil and data.IsAlive == true
+end
+
 local function teleportPlayersTo(spawnPart: BasePart)
 	for _, player in Players:GetPlayers() do
-		teleportPlayerTo(player, spawnPart.CFrame)
+		if isAlive(player) then
+			teleportPlayerTo(player, spawnPart.CFrame)
+		end
 	end
 end
+
+local function applyGhostState(character: Model)
+	for _, descendant in character:GetDescendants() do
+		if descendant:IsA("BasePart") then
+			descendant.CanCollide = false
+		elseif descendant:IsA("BillboardGui") then
+			descendant.Enabled = false
+		end
+	end
+
+	local humanoid = character:WaitForChild("Humanoid") :: Humanoid
+	humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+end
+
+local function catchRespawn(player: Player, character: Model)
+	local data = PlayerData[player.UserId]
+	if data and data.IsAlive == false then
+		applyGhostState(character)
+	end
+end
+
+local function hookRespawnCatcher(player: Player)
+	player.CharacterAdded:Connect(function(character)
+		catchRespawn(player, character)
+	end)
+end
+
+for _, player in Players:GetPlayers() do
+	hookRespawnCatcher(player)
+end
+
+Players.PlayerAdded:Connect(hookRespawnCatcher)
 
 local function notifyExecutioners()
 	print("Entering Night Phase. Checking PendingActions...")
@@ -139,12 +190,15 @@ local function notifyExecutioners()
 			ExecutionPrompt:FireClient(player, targetName)
 		end
 	end
-
-	table.clear(PendingActions)
 end
 
 local function runSecretMeetings()
-	local players = Players:GetPlayers()
+	local players = {}
+	for _, player in Players:GetPlayers() do
+		if isAlive(player) then
+			table.insert(players, player)
+		end
+	end
 	shuffle(players)
 
 	local roomIndex = 1
@@ -199,6 +253,7 @@ while true do
 			updateGameStateDisplay()
 			break
 		else
+			table.clear(PendingActions)
 			GameState.CurrentDay += 1
 			GameState.CurrentState = "DayGathering"
 			teleportPlayersTo(Workspace.GrandHall.SpawnPoint_Main)

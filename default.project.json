@@ -24,6 +24,12 @@
       },
       "GetMyRole": {
         "$className": "RemoteFunction"
+      },
+      "AliveStatusUpdate": {
+        "$className": "RemoteEvent"
+      },
+      "OrderVoided": {
+        "$className": "RemoteEvent"
       }
     },
 

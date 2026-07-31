@@ -78,17 +78,21 @@ local function populatePlayerList()
 end
 
 local function updateVisibility()
-	hideAllMenus()
-
 	print("VISIBILITY CHECK -> Role: ", tostring(localPlayerRole), " | State: ", tostring(CurrentGameState.Value))
 
-	local isSecretMeetings = string.find(string.lower(CurrentGameState.Value), "secret") ~= nil
+	local stateValue = string.lower(CurrentGameState.Value)
+	local isSecretMeetings = string.find(stateValue, "secret") ~= nil
+	local isNightPhase = string.find(stateValue, "night") ~= nil
 
 	if isSecretMeetings and localPlayerRole == "King" then
 		kingMurderAbility.Visible = true
 		populatePlayerList()
 	else
 		kingMurderAbility.Visible = false
+	end
+
+	if not isNightPhase then
+		executionerMenu.Visible = false
 	end
 end
 

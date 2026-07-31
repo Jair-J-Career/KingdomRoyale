@@ -111,6 +111,15 @@ end
 local function notifyExecutioners()
 	print("Entering Night Phase. Checking PendingActions...")
 
+	for i, action in PendingActions do
+		print("[DEBUG] PendingActions[" .. tostring(i) .. "] ActionType:", action.ActionType, "Target:", action.Target)
+	end
+
+	for _, player in Players:GetPlayers() do
+		local data = PlayerData[player.UserId]
+		print("[DEBUG] Player:", player.Name, "Role:", data and data.Role or "<no PlayerData>")
+	end
+
 	local targetName
 	for _, action in PendingActions do
 		if action.ActionType == "OrderMurder" then

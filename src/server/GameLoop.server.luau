@@ -5,12 +5,9 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CurrentGameState = ReplicatedStorage:WaitForChild("CurrentGameState")
 local RoleAssigned = ReplicatedStorage:WaitForChild("RoleAssigned")
 
-local GameState = {
-	CurrentState = "WaitingForPlayers",
-	CurrentDay = 1,
-}
-
-local PlayerData = {}
+local SharedState = require(ReplicatedStorage.Shared.GameState)
+local GameState = SharedState.GameState
+local PlayerData = SharedState.PlayerData
 
 local STATE_DISPLAY_NAMES = {
 	WaitingForPlayers = "Waiting for Players",
@@ -52,16 +49,31 @@ local function shuffle(array)
 end
 
 local function assignRoles()
-	local shuffledRoles = table.clone(ROLES)
-	shuffle(shuffledRoles)
+	local availableRoles = table.clone(ROLES)
 
-	for i, player in Players:GetPlayers() do
-		local role = shuffledRoles[i]
-		PlayerData[player.UserId] = {
-			Role = role,
+	-- Test rig: force Player1 to King so role-specific flows can be tested solo.
+	local riggedPlayer = Players:FindFirstChild("Player1")
+	if riggedPlayer then
+		PlayerData[riggedPlayer.UserId] = {
+			Role = "King",
 		}
-		print(player.Name .. " has been assigned the role of " .. role)
-		RoleAssigned:FireClient(player, role)
+		print(riggedPlayer.Name .. " has been assigned the role of King")
+		RoleAssigned:FireClient(riggedPlayer, "King")
+
+		table.remove(availableRoles, table.find(availableRoles, "King"))
+	end
+
+	shuffle(availableRoles)
+
+	for _, player in Players:GetPlayers() do
+		if player ~= riggedPlayer then
+			local role = table.remove(availableRoles, 1)
+			PlayerData[player.UserId] = {
+				Role = role,
+			}
+			print(player.Name .. " has been assigned the role of " .. role)
+			RoleAssigned:FireClient(player, role)
+		end
 	end
 end
 

@@ -15,6 +15,9 @@
       },
       "RoleAssigned": {
         "$className": "RemoteEvent"
+      },
+      "ActionRequest": {
+        "$className": "RemoteEvent"
       }
     },
 

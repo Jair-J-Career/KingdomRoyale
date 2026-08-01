@@ -8,11 +8,25 @@ local OrderVoided = ReplicatedStorage:WaitForChild("OrderVoided")
 local FakeOrderRevealed = ReplicatedStorage:WaitForChild("FakeOrderRevealed")
 local PartnerDitched = ReplicatedStorage:WaitForChild("PartnerDitched")
 local StrikeIntercepted = ReplicatedStorage:WaitForChild("StrikeIntercepted")
+local RoleRevealed = ReplicatedStorage:WaitForChild("RoleRevealed")
 
 local SharedState = require(ReplicatedStorage.Shared.GameState)
 local GameState = SharedState.GameState
 local PlayerData = SharedState.PlayerData
 local PendingActions = GameState.PendingActions
+
+local WIN_CONDITIONS = {
+	King = "The Crown",
+	Sorcerer = "The Crown",
+	Prince = "The Crown",
+	Knight = "The Crown",
+	Double = "The Crown",
+	Revolutionary = "The Uprising",
+	Peasant = "The Uprising",
+	Spy = "The Uprising",
+	Usurper = "The Rogue",
+	Martyr = "The Oathbound",
+}
 
 GetMyRole.OnServerInvoke = function(player: Player)
 	local data = PlayerData[player.UserId]
@@ -28,6 +42,9 @@ local function broadcastAliveStatus()
 			Name = player.Name,
 			IsAlive = data ~= nil and data.IsAlive == true,
 			Cooldown = (data and data.Cooldown) or 0,
+			ProtectedTarget = data and data.ProtectedTargetUserId,
+			BishopCooldown = data and data.BishopCooldown,
+			ScannedPlayers = data and data.ScannedPlayers,
 		})
 	end
 	AliveStatusUpdate:FireAllClients(snapshot)
@@ -158,13 +175,81 @@ local function handleMartyrOath(player: Player, targetName: string)
 		return
 	end
 
-	if GameState.SecretPairs[player.UserId] ~= targetPlayer.UserId then
+	local martyrCharacter = player.Character
+	local martyrRoot = martyrCharacter and martyrCharacter:FindFirstChild("HumanoidRootPart")
+	if not martyrRoot then
 		return
 	end
+
+	local targetCharacter = targetPlayer.Character
+	local targetRoot = targetCharacter and targetCharacter:FindFirstChild("HumanoidRootPart")
+	if not targetRoot then
+		return
+	end
+
+	local partnerUserId = GameState.SecretPairs[player.UserId]
+	if partnerUserId then
+		local partnerPlayer = Players:GetPlayerByUserId(partnerUserId)
+		if partnerPlayer then
+			PartnerDitched:FireClient(partnerPlayer)
+		end
+	end
+
+	local oldPartnerId = GameState.SecretPairs[player.UserId]
+	if oldPartnerId then
+		GameState.SecretPairs[player.UserId] = nil
+		GameState.SecretPairs[oldPartnerId] = nil
+	end
+
+	print("[MARTYR] Teleporting to " .. targetName)
+	martyrCharacter:PivotTo(targetRoot.CFrame * CFrame.new(0, 5, 0))
 
 	requesterData.ProtectedTargetUserId = targetPlayer.UserId
 
 	print(player.Name .. " (Martyr) swore an oath to protect " .. targetPlayer.Name)
+end
+
+local function handleBishopReveal(player: Player)
+	if GameState.CurrentState ~= "SecretMeetings" then
+		return
+	end
+
+	local requesterData = PlayerData[player.UserId]
+	if not requesterData or requesterData.Role ~= "Bishop" then
+		return
+	end
+
+	if requesterData.IsAlive ~= true then
+		return
+	end
+
+	if requesterData.BishopCooldown ~= 0 then
+		return
+	end
+
+	local targetId = GameState.SecretPairs[player.UserId]
+	if targetId == nil then
+		return
+	end
+
+	if table.find(requesterData.ScannedPlayers, targetId) then
+		return
+	end
+
+	requesterData.BishopCooldown = 2
+	table.insert(requesterData.ScannedPlayers, targetId)
+
+	local targetPlayer = Players:GetPlayerByUserId(targetId)
+	local targetData = PlayerData[targetId]
+	if not targetPlayer or not targetData then
+		return
+	end
+
+	local winCondition = WIN_CONDITIONS[targetData.Role]
+
+	RoleRevealed:FireClient(player, targetPlayer.Name, winCondition)
+
+	print(player.Name .. " (Bishop) secretly scanned " .. targetPlayer.Name .. " -- " .. tostring(winCondition))
 end
 
 local function handleConfirmExecution(player: Player, targetName: string)
@@ -380,8 +465,12 @@ local function handleAssassination(player: Player, targetName: string)
 	broadcastAliveStatus()
 end
 
-ActionRequest.OnServerEvent:Connect(function(player: Player, actionType: string, targetName: string)
-	if typeof(actionType) ~= "string" or typeof(targetName) ~= "string" then
+ActionRequest.OnServerEvent:Connect(function(player: Player, actionType: string, targetName: string?)
+	if typeof(actionType) ~= "string" then
+		return
+	end
+
+	if targetName ~= nil and typeof(targetName) ~= "string" then
 		return
 	end
 
@@ -397,5 +486,7 @@ ActionRequest.OnServerEvent:Connect(function(player: Player, actionType: string,
 		handleAssassination(player, targetName)
 	elseif actionType == "Eavesdrop" then
 		handleEavesdrop(player, targetName)
+	elseif actionType == "BishopReveal" then
+		handleBishopReveal(player)
 	end
 end)

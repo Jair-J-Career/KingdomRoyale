@@ -42,6 +42,9 @@
       },
       "StrikeIntercepted": {
         "$className": "RemoteEvent"
+      },
+      "RoleRevealed": {
+        "$className": "RemoteEvent"
       }
     },
 

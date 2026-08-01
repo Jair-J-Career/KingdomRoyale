@@ -70,8 +70,8 @@ local function shuffle(array)
 end
 
 -- Test rig: the first three players (sorted by name) are forced into fixed roles
--- so the Spy -> King -> Sorcerer flow can be tested together.
-local TEST_RIG_ROLES = { "Spy", "King", "Sorcerer" }
+-- so the Bishop's cooldown-based scan ability can be tested against a King.
+local TEST_RIG_ROLES = { "Bishop", "Peasant", "King" }
 
 local function broadcastAliveStatus()
 	local snapshot = {}
@@ -82,6 +82,9 @@ local function broadcastAliveStatus()
 			Name = player.Name,
 			IsAlive = data ~= nil and data.IsAlive == true,
 			Cooldown = (data and data.Cooldown) or 0,
+			ProtectedTarget = data and data.ProtectedTargetUserId,
+			BishopCooldown = data and data.BishopCooldown,
+			ScannedPlayers = data and data.ScannedPlayers,
 		})
 	end
 	AliveStatusUpdate:FireAllClients(snapshot)
@@ -110,6 +113,8 @@ local function assignRoles()
 				Role = role,
 				IsAlive = true,
 				ProtectedTargetUserId = nil,
+				BishopCooldown = 0,
+				ScannedPlayers = {},
 			}
 			print(player.Name .. " has been assigned the role of " .. role)
 			RoleAssigned:FireClient(player, role)
@@ -127,6 +132,8 @@ local function assignRoles()
 			Role = role,
 			IsAlive = true,
 			ProtectedTargetUserId = nil,
+			BishopCooldown = 0,
+			ScannedPlayers = {},
 		}
 		print(player.Name .. " has been assigned the role of " .. role)
 		RoleAssigned:FireClient(player, role)
@@ -264,6 +271,10 @@ local function pairPlayersInRoom(playerA: Player, playerB: Player, room: BasePar
 end
 
 local function runSecretMeetings()
+	-- Give late-loading characters (e.g. a player who just joined) time to finish spawning
+	-- before we go grabbing HumanoidRootParts for teleportation.
+	task.wait(1)
+
 	local players = {}
 	for _, player in Players:GetPlayers() do
 		if isAlive(player) then
@@ -279,30 +290,13 @@ local function runSecretMeetings()
 
 	local roomIndex = 1
 
-	-- Forced Matchmaking: once a Martyr has sworn their oath, they are locked into their
-	-- protected target's room every cycle, ahead of the normal pairing pass below.
-	for _, player in players do
-		local data = PlayerData[player.UserId]
-		if data and data.Role == "Martyr" and data.ProtectedTargetUserId then
-			local protectedPlayer = Players:GetPlayerByUserId(data.ProtectedTargetUserId)
-			if protectedPlayer and isAlive(protectedPlayer) then
-				table.remove(players, table.find(players, protectedPlayer))
-				table.remove(players, table.find(players, player))
-
-				local room = Workspace.SecretRooms:FindFirstChild("Room" .. roomIndex)
-				pairPlayersInRoom(player, protectedPlayer, room, " (Martyr's forced oath pairing)")
-				roomIndex += 1
-			end
-			break
-		end
-	end
-
 	for i = 1, #players, 2 do
 		local playerA = players[i]
 		local playerB = players[i + 1]
 
 		if playerB then
 			local room = Workspace.SecretRooms:FindFirstChild("Room" .. roomIndex)
+			print("[MATCHMAKING] Pairing " .. playerA.Name .. " and " .. playerB.Name .. " in Room " .. roomIndex)
 			pairPlayersInRoom(playerA, playerB, room)
 			roomIndex += 1
 		else
@@ -310,6 +304,31 @@ local function runSecretMeetings()
 			teleportPlayerTo(playerA, soloRoom.CFrame)
 			RoomPartnerSync:FireClient(playerA, "")
 			print(playerA.Name .. " has no pair and was sent to " .. soloRoom.Name)
+		end
+	end
+
+	-- Third Wheel: after the standard pairing pass has placed everyone (including any Martyr's
+	-- protected target) into a room, any Martyr who has sworn their oath teleports into their
+	-- protected target's room as an uninvited third person, wherever that target ended up.
+	for _, player in players do
+		local data = PlayerData[player.UserId]
+		if data and data.Role == "Martyr" and data.ProtectedTargetUserId then
+			local protectedPlayer = Players:GetPlayerByUserId(data.ProtectedTargetUserId)
+			if protectedPlayer and isAlive(protectedPlayer) then
+				local protectedCharacter = protectedPlayer.Character
+				local protectedRoot = protectedCharacter and protectedCharacter:FindFirstChild("HumanoidRootPart")
+				local martyrCharacter = player.Character
+				if protectedRoot and martyrCharacter then
+					local oldPartnerId = GameState.SecretPairs[player.UserId]
+					if oldPartnerId then
+						GameState.SecretPairs[player.UserId] = nil
+						GameState.SecretPairs[oldPartnerId] = nil
+					end
+
+					martyrCharacter:PivotTo(protectedRoot.CFrame * CFrame.new(0, 5, 0))
+					print(player.Name .. " (Martyr) infiltrated " .. protectedPlayer.Name .. "'s room to honor their oath")
+				end
+			end
 		end
 	end
 end
@@ -330,10 +349,24 @@ while true do
 	print(GameState.CurrentState, GameState.CurrentDay)
 
 	if GameState.CurrentState == "WaitingForPlayers" then
+		-- Force the server to wait for all 3 test clients to connect
+		while #Players:GetPlayers() < 3 do
+			task.wait(1)
+		end
+
 		assignRoles()
 		GameState.CurrentState = "DayGathering"
 		teleportPlayersTo(Workspace.GrandHall.SpawnPoint_Main)
 	elseif GameState.CurrentState == "DayGathering" then
+		for _, player in Players:GetPlayers() do
+			if isAlive(player) then
+				local data = PlayerData[player.UserId]
+				if data and data.Role == "Bishop" and data.BishopCooldown and data.BishopCooldown > 0 then
+					data.BishopCooldown -= 1
+				end
+			end
+		end
+
 		GameState.CurrentState = "SecretMeetings"
 		runSecretMeetings()
 	elseif GameState.CurrentState == "SecretMeetings" then

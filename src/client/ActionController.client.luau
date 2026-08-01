@@ -12,6 +12,8 @@ local OrderVoided = ReplicatedStorage:WaitForChild("OrderVoided")
 local FakeOrderRevealed = ReplicatedStorage:WaitForChild("FakeOrderRevealed")
 local PartnerDitched = ReplicatedStorage:WaitForChild("PartnerDitched")
 local RoomPartnerSync = ReplicatedStorage:WaitForChild("RoomPartnerSync")
+local StrikeIntercepted = ReplicatedStorage:WaitForChild("StrikeIntercepted")
+local RoleRevealed = ReplicatedStorage:WaitForChild("RoleRevealed")
 
 local localPlayer = Players.LocalPlayer
 local playerGui = localPlayer:WaitForChild("PlayerGui")
@@ -37,6 +39,13 @@ local spyMenu = actionUI:WaitForChild("SpyMenu")
 local spyTargetList = spyMenu:WaitForChild("PlayerList")
 local eavesdropButton = spyMenu:WaitForChild("EavesdropButton")
 
+local martyrMenu = actionUI:WaitForChild("MartyrMenu")
+local martyrTargetList = martyrMenu:WaitForChild("PlayerList")
+local oathButton = martyrMenu:WaitForChild("OathButton")
+
+local bishopMenu = actionUI:WaitForChild("BishopMenu")
+local revealButton = bishopMenu:WaitForChild("RevealButton")
+
 local DEFAULT_COLOR = Color3.fromRGB(50, 50, 50)
 local SELECTED_COLOR = Color3.fromRGB(0, 170, 0)
 local TEXT_COLOR = Color3.fromRGB(255, 255, 255)
@@ -49,9 +58,13 @@ local selectedTarget: string? = nil
 local selectedAssassinationTarget: string? = nil
 local selectedUsurperTarget: string? = nil
 local selectedSpyTarget: string? = nil
+local selectedMartyrTarget: string? = nil
 local currentRoomPartner: string? = nil
 local localPlayerRole: string? = GetMyRole:InvokeServer()
 local pendingExecutionTarget: string? = nil
+local localProtectedTarget: number? = nil
+local localBishopCooldown: number = 0
+local localScannedPlayers: { number } = {}
 
 local activeMenu = "None"
 local aliveStatus: { [number]: boolean } = {}
@@ -71,6 +84,8 @@ local function renderUI()
 	assassinationMenu.Visible = (activeMenu == "Assassination")
 	usurperMenu.Visible = (activeMenu == "Usurper")
 	spyMenu.Visible = (activeMenu == "Spy")
+	martyrMenu.Visible = (activeMenu == "Martyr")
+	bishopMenu.Visible = (activeMenu == "Bishop")
 end
 
 local function setCharacterTransparency(character: Model, transparency: number)
@@ -113,7 +128,17 @@ local function updateGhostVisibility()
 end
 
 AliveStatusUpdate.OnClientEvent:Connect(
-	function(snapshot: { { UserId: number, Name: string, IsAlive: boolean, Cooldown: number? } })
+	function(snapshot: {
+		{
+			UserId: number,
+			Name: string,
+			IsAlive: boolean,
+			Cooldown: number?,
+			ProtectedTarget: number?,
+			BishopCooldown: number?,
+			ScannedPlayers: { number }?,
+		}
+	})
 		local wasLocalPlayerAlive = isPlayerAlive(localPlayer)
 
 		local newStatus = {}
@@ -121,6 +146,11 @@ AliveStatusUpdate.OnClientEvent:Connect(
 		for _, entry in pairs(snapshot) do
 			newStatus[entry.UserId] = entry.IsAlive
 			newCooldowns[entry.UserId] = entry.Cooldown or 0
+			if entry.UserId == localPlayer.UserId then
+				localProtectedTarget = entry.ProtectedTarget
+				localBishopCooldown = entry.BishopCooldown or 0
+				localScannedPlayers = entry.ScannedPlayers or {}
+			end
 		end
 		aliveStatus = newStatus
 		cooldownStatus = newCooldowns
@@ -136,8 +166,9 @@ AliveStatusUpdate.OnClientEvent:Connect(
 )
 
 local BANNER_TEXT_COLOR = Color3.fromRGB(255, 0, 0)
+local BANNER_SUCCESS_COLOR = Color3.fromRGB(0, 200, 0)
 
-local function showTemporaryBanner(name: string, text: string, duration: number)
+local function showTemporaryBanner(name: string, text: string, duration: number, color: Color3?)
 	local existing = actionUI:FindFirstChild(name)
 	if existing then
 		existing:Destroy()
@@ -150,7 +181,7 @@ local function showTemporaryBanner(name: string, text: string, duration: number)
 	banner.BackgroundTransparency = 1
 	banner.TextScaled = true
 	banner.Font = Enum.Font.SourceSansBold
-	banner.TextColor3 = BANNER_TEXT_COLOR
+	banner.TextColor3 = color or BANNER_TEXT_COLOR
 	banner.Text = text
 	banner.Parent = actionUI
 
@@ -418,11 +449,67 @@ local function populateSpyList()
 	end
 end
 
+local function resetMartyrButtonColors()
+	for _, child in martyrTargetList:GetChildren() do
+		if child:IsA("TextButton") then
+			child.BackgroundColor3 = DEFAULT_COLOR
+		end
+	end
+end
+
+local function selectMartyrTarget(targetName: string, clickedButton: TextButton)
+	selectedMartyrTarget = targetName
+	resetMartyrButtonColors()
+	clickedButton.BackgroundColor3 = SELECTED_COLOR
+end
+
+local function populateMartyrList()
+	clearNoTargetsLabel(martyrTargetList)
+	for _, child in martyrTargetList:GetChildren() do
+		if child:IsA("TextButton") then
+			child:Destroy()
+		end
+	end
+
+	local targetCount = 0
+	for _, player in Players:GetPlayers() do
+		if player ~= Players.LocalPlayer and isPlayerAlive(player) then
+			targetCount += 1
+
+			local button = Instance.new("TextButton")
+			button.Name = player.Name
+			button.Text = player.Name
+			button.Size = UDim2.new(1, 0, 0, 50)
+			button.TextScaled = true
+			button.BackgroundColor3 = DEFAULT_COLOR
+			button.TextColor3 = TEXT_COLOR
+			button.Parent = martyrTargetList
+
+			button.MouseButton1Click:Connect(function()
+				selectMartyrTarget(player.Name, button)
+			end)
+		end
+	end
+
+	setActionButtonEnabled(oathButton, targetCount > 0)
+	if targetCount == 0 then
+		showNoTargetsLabel(martyrTargetList)
+	end
+end
+
 local function updateVisibility()
 	print("VISIBILITY CHECK -> Role: ", tostring(localPlayerRole), " | State: ", tostring(CurrentGameState.Value))
 
 	local stateLower = string.lower(CurrentGameState.Value)
 	local localCooldown = cooldownStatus[localPlayer.UserId] or 0
+
+	local bishopPartnerAlreadyScanned = false
+	if currentRoomPartner then
+		local partnerPlayer = Players:FindFirstChild(currentRoomPartner)
+		if partnerPlayer and table.find(localScannedPlayers, partnerPlayer.UserId) then
+			bishopPartnerAlreadyScanned = true
+		end
+	end
 
 	if string.find(stateLower, "secret") and localPlayerRole == "King" then
 		activeMenu = "KingMurder"
@@ -430,6 +517,17 @@ local function updateVisibility()
 	elseif string.find(stateLower, "secret") and localPlayerRole == "Spy" then
 		activeMenu = "Spy"
 		populateSpyList()
+	elseif string.find(stateLower, "secret") and localPlayerRole == "Martyr" and localProtectedTarget == nil then
+		activeMenu = "Martyr"
+		populateMartyrList()
+	elseif
+		string.find(stateLower, "secret")
+		and localPlayerRole == "Bishop"
+		and localBishopCooldown == 0
+		and currentRoomPartner ~= nil
+		and not bishopPartnerAlreadyScanned
+	then
+		activeMenu = "Bishop"
 	elseif string.find(stateLower, "night") and localPlayerRole == "Revolutionary" then
 		activeMenu = "Assassination"
 		populateAssassinationList()
@@ -513,6 +611,41 @@ eavesdropButton.MouseButton1Click:Connect(function()
 	resetSpyButtonColors()
 	activeMenu = "None"
 	renderUI()
+end)
+
+oathButton.MouseButton1Click:Connect(function()
+	if not selectedMartyrTarget then
+		return
+	end
+
+	ActionRequest:FireServer("MartyrOath", selectedMartyrTarget)
+	selectedMartyrTarget = nil
+	resetMartyrButtonColors()
+	activeMenu = "None"
+	renderUI()
+end)
+
+StrikeIntercepted.OnClientEvent:Connect(function(martyrName: string, originalTargetName: string)
+	showTemporaryBanner(
+		"StrikeInterceptedBanner",
+		"YOUR STRIKE ON " .. originalTargetName:upper() .. " WAS INTERCEPTED BY " .. martyrName:upper() .. "!",
+		6
+	)
+end)
+
+revealButton.MouseButton1Click:Connect(function()
+	ActionRequest:FireServer("BishopReveal")
+	activeMenu = "None"
+	renderUI()
+end)
+
+RoleRevealed.OnClientEvent:Connect(function(targetName: string, winCondition: string)
+	showTemporaryBanner(
+		"RoleRevealedBanner",
+		targetName:upper() .. " FIGHTS FOR: " .. winCondition:upper(),
+		6,
+		BANNER_SUCCESS_COLOR
+	)
 end)
 
 updateVisibility()

@@ -48,6 +48,27 @@ generalChannel.ShouldDeliverCallback = function(textChatMessage: TextChatMessage
 			return false
 		end
 
+		if senderData.Role == "Martyr" and senderData.ProtectedTargetUserId ~= nil then
+			local protectedId = senderData.ProtectedTargetUserId
+			local protectedPartnerId = GameState.SecretPairs[protectedId]
+
+			if targetId == protectedId or targetId == protectedPartnerId then
+				return true
+			else
+				return false -- CRITICAL: Explicitly block the Martyr's chat from reaching anyone else
+			end
+		end
+
+		if targetData.Role == "Martyr" and targetData.ProtectedTargetUserId then
+			if senderId == targetData.ProtectedTargetUserId then
+				return true
+			end
+
+			if senderId == GameState.SecretPairs[targetData.ProtectedTargetUserId] then
+				return true
+			end
+		end
+
 		if senderData.IsAlive == true and targetData.IsAlive == true then
 			if GameState.SecretPairs[senderId] == targetId then
 				return true

@@ -30,6 +30,18 @@
       },
       "OrderVoided": {
         "$className": "RemoteEvent"
+      },
+      "FakeOrderRevealed": {
+        "$className": "RemoteEvent"
+      },
+      "PartnerDitched": {
+        "$className": "RemoteEvent"
+      },
+      "RoomPartnerSync": {
+        "$className": "RemoteEvent"
+      },
+      "StrikeIntercepted": {
+        "$className": "RemoteEvent"
       }
     },
 

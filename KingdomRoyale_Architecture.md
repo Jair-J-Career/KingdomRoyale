@@ -1,5 +1,7 @@
 # Kingdom Royale — Architecture
 
+Complete architecture reference as of the end of Phase C ("The Passive Inheritors"). Phases A ("The Room Crashers": Spy, Martyr, Bishop) and B ("The Uprising": Peasant) are also fully implemented. This document is the single source of truth for the game's server/client engine — every section below was verified directly against the current contents of the source files it describes.
+
 ## 1. Project Structure
 
 ```
@@ -8,15 +10,16 @@ Kingdom_Royale/
 └── src/
     ├── server/
     │   ├── init.server.luau       # placeholder entry script
-    │   ├── GameLoop.server.luau   # Day/Night state machine, role assignment, teleports, ghost CollisionGroups, cooldown ticking
-    │   ├── ActionHandler.server.luau  # Validates/executes OrderMurder, OrderFakeMurder, MartyrOath, ConfirmExecution, Assassinate, Eavesdrop
-    │   └── ChatFilter.server.luau # ShouldDeliverCallback-based Graveyard chat filter
+    │   ├── GameLoop.server.luau   # Day/Night state machine, role assignment, teleports, collision groups, cooldown ticking
+    │   ├── ActionHandler.server.luau  # Validates/executes every role ability + the King/Usurper order system
+    │   └── ChatFilter.server.luau # ShouldDeliverCallback-based Graveyard/room-privacy/eavesdropping chat filter
     ├── client/
     │   ├── init.client.luau       # placeholder entry script
     │   ├── HUDController.client.luau   # Top clock + role card display
-    │   └── ActionController.client.luau # State-driven menu UI (King/Executioner/Assassination/Usurper/Spy/Martyr) + ghost visibility polling
+    │   └── ActionController.client.luau # State-driven menu UI for every role + ghost visibility polling
     └── shared/
-        ├── GameState.luau         # Single source of truth for GameState + PlayerData (incl. SecretPairs, SpyConnections, SpyTarget)
+        ├── GameState.luau         # Single source of truth for GameState + PlayerData
+        ├── Tribunal.luau          # Shared Tribunal.Execute(targetPlayer) — see §12
         └── Hello.luau             # unused sample module
 ```
 
@@ -25,106 +28,204 @@ Rojo mapping (`default.project.json`):
 - `src/server` → `ServerScriptService.Server`
 - `src/client` → `StarterPlayer.StarterPlayerScripts.Client`
 
-## 2. The State Machine (`GameLoop.server.luau`)
+`GameLoop.server.luau` and `ActionHandler.server.luau` are independent `Script` instances (not ModuleScripts) that both `require()` `GameState.luau` and mutate the same live tables through it — there is no ownership boundary between them. This split exists because `GameLoop.server.luau` owns the day/night timer and phase transitions, while `ActionHandler.server.luau` owns the single `ActionRequest` dispatcher that every role ability routes through. `ChatFilter.server.luau` is a third, independent consumer of the same shared state, used only for read access.
 
-The night/day cycle is a single `while true do` loop driven by `GameState.CurrentState`, a string field on the shared `GameState` table. Each iteration waits, then transitions to the next phase:
+## 2. Roles & Win Conditions
 
-| Current `CurrentState`   | Wait Condition                    | Action Taken                                                                 | Next `CurrentState` |
-|---------------------------|------------------------------------|--------------------------------------------------------------------------------|----------------------|
-| `WaitingForPlayers`       | until `#Players:GetPlayers() >= 3` | `assignRoles()`, teleport to `GrandHall.SpawnPoint_Main`                       | `DayGathering`       |
-| `DayGathering`             | `task.wait(5)`                    | decrement any living Bishop's `BishopCooldown` (if `> 0`) — see §13 — then `runSecretMeetings()` (pairs players into `Workspace.SecretRooms`, including forced Martyr/protected-target pairing — see §11) | `SecretMeetings`     |
-| `SecretMeetings`           | `task.wait(20)`                   | `table.clear(GameState.SecretPairs)`, `GameState.SpyTarget = nil`, `removeSpyInvisibility()` for every living Spy, teleport to `GrandHall.SpawnPoint_Main` | `EveningGathering`   |
-| `EveningGathering`         | `task.wait(5)`                    | teleport to `PrivateQuarters.SpawnPoint_Private`, `notifyExecutioners()`       | `NightPhase`         |
-| `NightPhase`               | `task.wait(5)`                    | if `CurrentDay == 6`: `CurrentState = "GameOver"` and loop `break`; else `CurrentDay += 1`, teleport to `GrandHall.SpawnPoint_Main`, `tickCooldowns()`, `broadcastAliveStatus()` | `DayGathering` (or `GameOver`) |
+15 roles are defined in `ROLES` (`GameLoop.server.luau`), matching a 15-player lobby:
 
-`SecretMeetings` gets a longer 20-second window (vs. 5 for every other phase) because it's the only phase where players are expected to actually *do* something interactively — hold a private conversation, have the King issue an order, let a Spy eavesdrop, let a Martyr swear their oath — rather than just observe a teleport/prompt.
+```lua
+local ROLES = {
+    "King", "Prince", "Double", "Sorcerer", "Knight",
+    "Revolutionary", "Usurper", "Bishop", "Martyr", "Spy",
+    "Peasant", "Peasant", "Peasant", "Peasant", "Peasant",
+}
+```
 
-Exact phase string values used throughout the codebase (case-sensitive):
-`"WaitingForPlayers"`, `"DayGathering"`, `"SecretMeetings"`, `"EveningGathering"`, `"NightPhase"`, `"GameOver"`.
+Win conditions (`WIN_CONDITIONS` in `ActionHandler.server.luau`, used by the Bishop's reveal — see §11.3):
 
-`updateGameStateDisplay()` runs after every transition and writes a human-readable version (via `STATE_DISPLAY_NAMES`) into `ReplicatedStorage.CurrentGameState.Value`, formatted as `"Day %d: %s"` (e.g. `"Day 1: Secret Meetings"`, `"Day 1: Night Phase"`). This `StringValue` is the only channel clients read the phase from — clients pattern-match on lowercased substrings (`"secret"`, `"night"`, `"day gathering"`) rather than the raw state name.
+| Win Condition | Roles |
+|---|---|
+| The Crown | King, Sorcerer, Prince, Knight, Double |
+| The Uprising | Revolutionary, Peasant, Spy |
+| The Rogue | Usurper |
+| The Oathbound | Martyr |
+| *(none)* | Bishop — has no entry in `WIN_CONDITIONS`; scanning a Bishop resolves `winCondition` to `nil` and would display `"NIL"` in the reveal banner. Untested in practice since the current test rigs never seat two Bishops. |
 
-`notifyExecutioners()` (called on entering `NightPhase`) logs `PendingActions.ActiveMurder` and every player's assigned `Role` for diagnostics, then — if an `ActiveMurder` exists — fires `ExecutionPrompt` with its `Target` to any player whose role is `Sorcerer` or `Knight`. The executioner has no way to tell from this prompt alone whether the order came from the King or the Usurper (see §10).
+## 3. The State Machine & Timers (`GameLoop.server.luau`)
 
-Every time the loop lands back on `DayGathering` from `NightPhase`, `tickCooldowns()` decrements every player's `Cooldown` (floor 0) and `broadcastAliveStatus()` pushes the updated values to clients — this is what re-enables the Usurper's menu two `DayGathering`s after a fake order gets caught.
+A single `while true do` loop, driven by `GameState.CurrentState`, alternates between a **wait** step and an **action** step every iteration, then always calls `updateGameStateDisplay()` at the very bottom regardless of which branch ran.
 
-## 3. Data & Networking
+### 3.1 Wait durations
 
-### `GameState.luau` (shared module, `ReplicatedStorage.Shared.GameState`)
+```lua
+if GameState.CurrentState == "WaitingForPlayers" then
+    repeat task.wait(1) until #Players:GetPlayers() >= 3
+elseif GameState.CurrentState == "SecretMeetings" then
+    task.wait(20)
+elseif GameState.CurrentState == "EveningGathering" then
+    if GameState.CurrentDay > 1 then task.wait(20) else task.wait(5) end
+else
+    task.wait(5)  -- DayGathering, EveningGathering-on-Day-1 falls through above, NightPhase
+end
+```
 
-Returns a table with two shared references used by all three server scripts:
+| Phase | Wait | Why |
+|---|---|---|
+| `WaitingForPlayers` | polls every 1s until `#Players >= 3` | lobby fill |
+| `DayGathering` | 5s | passive — just a teleport/cooldown-tick beat |
+| `SecretMeetings` | 20s | players hold a private conversation, King orders, Spy eavesdrops, Martyr swears, Bishop scans |
+| `EveningGathering` | 20s from Day 2 onward, 5s on Day 1 | Peasants need time to cast Tribunal votes; Day 1 has no prior day to vote about, so it stays quick |
+| `NightPhase` | 5s | passive — executions already resolved instantly server-side |
+
+### 3.2 Phase transition table
+
+| Current `CurrentState` | Action taken | Next `CurrentState` |
+|---|---|---|
+| `WaitingForPlayers` | Wait for **4** connected players (`while #Players:GetPlayers() < 4 do task.wait(1) end` — see the note below on why this differs from the 3-player wait above), then wait for every connected player to have a spawned `Character` (`player.CharacterAdded:Wait()` per player missing one), then `task.wait(2)` to let physics settle, then `assignRoles()`, teleport to `GrandHall.SpawnPoint_Main` | `DayGathering` |
+| `DayGathering` | Decrement every living Bishop's `BishopCooldown` (if `> 0`) via a dedicated loop, then `runSecretMeetings()` (pairs players into `Workspace.SecretRooms`, fires Gossip pings, runs Third Wheel Martyr placement — see §11.1/§11.2) | `SecretMeetings` |
+| `SecretMeetings` | `table.clear(GameState.SecretPairs)`, `GameState.SpyTarget = nil`, `removeSpyInvisibility()` for every living Spy, teleport to `GrandHall.SpawnPoint_Main` | `EveningGathering` |
+| `EveningGathering` | **Tribunal timeout tie-break** (see §12.4), then `table.clear(GameState.PeasantVotes)`, then a 6s pause *if* the tie-break fired, then teleport to `PrivateQuarters.SpawnPoint_Private`, `notifyExecutioners()` | `NightPhase` |
+| `NightPhase` | If `CurrentDay == 6`: `CurrentState = "GameOver"`, `updateGameStateDisplay()`, loop `break`. Else: `table.clear(PendingActions)`, `CurrentDay += 1`, teleport to `GrandHall.SpawnPoint_Main`, `tickCooldowns()`, `broadcastAliveStatus()` | `DayGathering` (or `GameOver`) |
+
+> **Note on the double player-count gate**: the `WaitingForPlayers` *wait* step uses `#Players:GetPlayers() >= 3`, but the `WaitingForPlayers` *action* block immediately re-gates on `#Players:GetPlayers() < 4`. The `>= 3` outer condition is effectively dead — the loop can't proceed past `WaitingForPlayers` until 4 players connect regardless, because the inner gate is stricter. This is a leftover from iterative test-rig tuning (earlier rigs used 3 players, current ones use 4); if the lobby size is ever changed again, both numbers need to move together or the outer wait becomes misleading.
+
+`notifyExecutioners()` (called on entering `NightPhase`): reads `PendingActions.ActiveMurder`; if none exists, returns immediately (no prompts sent that night). Otherwise scans for a living Sorcerer (`isSorcAlive`), then loops every player whose `Role` is `Sorcerer` or `Knight` and fires `ExecutionPrompt:FireClient(player, targetName)` — **except** a Knight is skipped entirely (`continue`) if `isSorcAlive == true` (see §8.2, Knight Lockout). This loop does **not** check the recipient's own `IsAlive` — a dead Sorcerer/Knight can still receive the prompt; `handleConfirmExecution()`'s own `requesterData.IsAlive == false` guard is what actually makes a dead executioner's confirm a no-op.
+
+`tickCooldowns()` (called once per `NightPhase → DayGathering` transition): decrements every `PlayerData` entry's generic `Cooldown` field (floor 0) if it's set — this is the Usurper's fake-order penalty (see §8.1), not related to `BishopCooldown` or `LastTribunalDay`, which use their own separate mechanisms.
+
+`updateGameStateDisplay()`: writes `ReplicatedStorage.CurrentGameState.Value = string.format("Day %d: %s", CurrentDay, displayName)` via `STATE_DISPLAY_NAMES`. This `StringValue` is the *only* channel the client reads game phase from — `ActionController.client.luau` lowercases it and does substring matches (`"secret"`, `"night"`, `"evening"`, `"day gathering"`), and also parses the leading day number back out of it (see §6.3).
+
+## 4. Data Layer
+
+### 4.1 `GameState.luau` (shared module, `ReplicatedStorage.Shared.GameState`)
 
 ```lua
 GameState = {
     CurrentState = "WaitingForPlayers",
     CurrentDay = 1,
     PendingActions = {},
-    SecretPairs = {},      -- bidirectional map: [UserId] = partnerUserId, for the current SecretMeetings room pairing
+    SecretPairs = {},      -- bidirectional map: [UserId] = partnerUserId, current SecretMeetings pairing
     SpyConnections = {},   -- [UserId] = the Spy's active DescendantAdded RBXScriptConnection, while eavesdropping
     SpyTarget = nil,       -- UserId the currently-eavesdropping Spy is standing over, or nil
+    PeasantVotes = {},     -- [voterUserId] = accusedUserId, current EveningGathering's Tribunal vote pool
+    LastTribunalDay = 0,   -- CurrentDay value as of the last Tribunal.Execute() call, or 0 if none has ever fired
 }
 PlayerData = {}
 ```
 
-Because Luau tables are passed by reference, `GameLoop.server.luau`, `ActionHandler.server.luau`, and `ChatFilter.server.luau` all `require()` this module and mutate/read the same underlying tables — there is no replication or ownership boundary between them; it's an in-process shared-state singleton, server-side only. `SecretPairs`, `SpyConnections`, and `SpyTarget` are all Spy/room-pairing state — see §11 for how they're written, and §7 for how `ChatFilter.server.luau` reads them.
+Because Luau tables are passed by reference, and Roblox caches a `ModuleScript`'s return value per-VM, every server script that `require()`s this module — `GameLoop.server.luau`, `ActionHandler.server.luau`, `ChatFilter.server.luau`, and `Tribunal.luau` — shares the exact same underlying `GameState`/`PlayerData` tables. There is no replication or ownership boundary; it's an in-process shared-state singleton, server-side only.
 
-### `PlayerData`
+`LastTribunalDay` is an **absolute day tracker**, not a countdown, by design: an earlier version used a decrementing `GameState.TribunalCooldown` (set to `2` on use, ticked down once per `DayGathering`), mirroring `PlayerData.BishopCooldown`. It was scrapped because the client used to independently derive "what day is it" by regex-matching the display string (`string.match(CurrentGameState.Value, "Day (%d+)")`), and that parse could race the server's cooldown ticks closely enough to make the Peasant menu fail to open on the day it should have. The fix was two-fold: (1) record the exact `CurrentDay` a Tribunal fired on instead of a countdown, and (2) have the server broadcast `CurrentDay` directly in `AliveStatusUpdate` so the client never derives it from a string at all (see §6.3). `TribunalCooldown` no longer exists anywhere in the codebase.
 
-Keyed by `player.UserId`. Each entry:
+### 4.2 `PlayerData`
+
+Keyed by `player.UserId`. Populated by `assignRoles()` in `GameLoop.server.luau` when `WaitingForPlayers` transitions to `DayGathering`:
 
 ```lua
 PlayerData[userId] = {
-    Role = "King" | "Sorcerer" | "Knight" | ... ,  -- one of the 15 ROLES entries
-    IsAlive = true | false,
-    Cooldown = 0,  -- optional; only set once a role has an active cooldown (currently just the Usurper)
-    ProtectedTargetUserId = nil,  -- Martyr only; the UserId they've sworn their oath to protect, or nil until sworn — see §11
-    BishopCooldown = 0,  -- Bishop only; days remaining before the next scan is allowed — see §13
-    ScannedPlayers = {},  -- Bishop only; UserIds already revealed, never re-scannable — see §13
+    Role = "King" | "Prince" | "Double" | "Sorcerer" | "Knight" | "Revolutionary"
+         | "Usurper" | "Bishop" | "Martyr" | "Spy" | "Peasant",
+    IsAlive = true,
+    ProtectedTargetUserId = nil,   -- Martyr only, see §11.2
+    BishopCooldown = 0,            -- Bishop only, see §11.3
+    ScannedPlayers = {},           -- Bishop only, see §11.3
+    HasCrown = (role == "King"),   -- everyone; only the starting King begins true, see §13
 }
 ```
 
-Populated by `assignRoles()` in `GameLoop.server.luau` when `WaitingForPlayers` transitions to `DayGathering` (`ProtectedTargetUserId` always starts `nil`, `BishopCooldown` always starts `0`, and `ScannedPlayers` always starts as a fresh empty table, regardless of role). `IsAlive` is flipped to `false` by `handleConfirmExecution()`/`handleAssassination()` in `ActionHandler.server.luau` once a kill lands — or by `redirectToMartyr()` on the *Martyr's own* entry when a strike is intercepted (see §11). `Cooldown` is set by `handleConfirmExecution()` when a Usurper's fake order gets executed (see §10), and decremented once per day by `tickCooldowns()` in `GameLoop.server.luau`. `ProtectedTargetUserId` is set exactly once, by `handleMartyrOath()`, and is never cleared for the rest of that game. `BishopCooldown` is set to `2` by `handleBishopReveal()` on every successful scan and decremented once per day by a dedicated loop at the start of `DayGathering` (see §2/§13) — deliberately **not** `tickCooldowns()`, which only touches the generic `Cooldown` field. `ScannedPlayers` only ever grows (`table.insert`), never shrinks, for the rest of that game. Clients never read `PlayerData` directly — they learn their own role via the `GetMyRole` RemoteFunction/`RoleAssigned` RemoteEvent, and their `IsAlive`/`Cooldown`/`ProtectedTargetUserId`/`BishopCooldown`/`ScannedPlayers` via the `AliveStatusUpdate` broadcast (see §8) — **with a caveat**, see §8.
+`Cooldown` is **not** in this initial literal — it's the Usurper's fake-order penalty field, and stays implicitly `nil` for every player until `handleConfirmExecution()` first sets `usurperData.Cooldown = 3` after a fake order is caught (see §8.1). `tickCooldowns()` and `broadcastAliveStatus()` both treat a missing `Cooldown` as falsy/`0` via truthy checks and `or 0` fallbacks respectively, so this is safe.
 
-### `PendingActions`
+Mutation summary:
+- `IsAlive` → `false` on any successful kill (`handleConfirmExecution()`, `handleAssassination()`, or a Martyr's own death inside `redirectToMartyr()`).
+- `ProtectedTargetUserId` → set exactly once by `handleMartyrOath()`, never cleared for the rest of the game.
+- `BishopCooldown` → `2` on every successful `handleBishopReveal()`; decremented by the dedicated per-day loop in `GameLoop.server.luau`'s `DayGathering` branch (not `tickCooldowns()`).
+- `ScannedPlayers` → grows via `table.insert()` in `handleBishopReveal()`, never shrinks.
+- `HasCrown` → flipped by `handleRoyalSuccession()` (see §13); the dead holder's flips to `false`, the successor's flips to `true`.
+- `Cooldown` → set to `3` by `handleConfirmExecution()` when a Usurper's fake order is confirmed; decremented by `tickCooldowns()` once per `NightPhase → DayGathering` transition.
 
-A single-slot mailbox for whichever murder order is currently active — see **§10 (Usurper & King Precedence)** for the full `ActiveMurder` structure and lifecycle. In short:
+Clients never read `PlayerData` directly — they learn their own role via `GetMyRole`/`RoleAssigned`, and everything else via the `AliveStatusUpdate` broadcast (§5.2).
+
+### 4.3 `PendingActions`
+
+A single-slot mailbox for whichever murder order is currently active:
 
 ```lua
 PendingActions.ActiveMurder = {
-    RequesterRole = "King" | "Usurper",
+    RequesterRole = "King" | "Usurper",  -- always this literal string, regardless of the requester's actual PlayerData.Role
     Target = "TargetPlayerName",
     RequesterId = 123456789,
 }
 ```
 
-Only one order can be active at a time — a King's order always overwrites a Usurper's, never the reverse. The whole `PendingActions` table is `table.clear()`-ed on the `NightPhase → DayGathering` transition.
+Only one order can be active — a King's order (`handleOrderMurder()`, `SecretMeetings` only, gated on `requesterData.HasCrown == true`) always overwrites a Usurper's fake one (`handleFakeMurder()`, `DayGathering` only, gated on `Role == "Usurper"` **and** `HasCrown ~= true` — see §13.3), never the reverse; a King's order rejects and voids any pending fake order, while a Usurper's attempt while a King's order already stands is rejected outright. `RequesterRole` is always the literal string `"King"` or `"Usurper"` — it tags *which precedence rule applies*, not the requester's literal `PlayerData.Role`, so a crowned Double/Prince/Usurper issuing the real order still writes `RequesterRole = "King"`. The whole table is `table.clear()`-ed on `NightPhase → DayGathering`.
 
-### RemoteEvents / RemoteFunctions (all declared in `default.project.json` under `ReplicatedStorage`)
+## 5. Networking
 
-| Name                 | Type            | Direction        | Purpose                                                                 |
-|----------------------|-----------------|-------------------|--------------------------------------------------------------------------|
-| `RoleAssigned`        | RemoteEvent     | Server → Client   | Fired once per player in `assignRoles()`; tells the client its role string. |
-| `ActionRequest`       | RemoteEvent     | Client → Server   | Generic action channel; payload is `(actionType: string, targetName: string?)` — `targetName` is optional, `nil` for `"BishopReveal"` (see §13), a required string for every other action type. Handles `"OrderMurder"`, `"OrderFakeMurder"`, `"MartyrOath"`, `"ConfirmExecution"`, `"Assassinate"`, `"Eavesdrop"`, and `"BishopReveal"`. |
-| `ExecutionPrompt`     | RemoteEvent     | Server → Client   | Fired to Sorcerer/Knight players in `notifyExecutioners()` with the active order's target name. |
-| `GetMyRole`           | RemoteFunction  | Client → Server   | Invoked once at client script start; returns the caller's `Role` from `PlayerData`, or `nil`. |
-| `AliveStatusUpdate`   | RemoteEvent     | Server → Client   | Broadcasts a snapshot of every player's `{UserId, Name, IsAlive, Cooldown, ProtectedTarget, BishopCooldown?, ScannedPlayers?}` — see §8 (the last two fields are only populated by `GameLoop.server.luau`'s copy of this broadcaster; see the caveat there). |
-| `OrderVoided`         | RemoteEvent     | Server → Client   | Fired to an executioner whose order died with its requester, or to a Usurper whose fake order was overwritten by the King — see §10. |
-| `FakeOrderRevealed`   | RemoteEvent     | Server → Client   | Fired to the executioner immediately after they complete a kill that turns out to have been the Usurper's fake order — see §10. |
-| `RoomPartnerSync`     | RemoteEvent     | Server → Client   | Fired to each player in `pairPlayersInRoom()` (and to solo players, with `""`) whenever `SecretMeetings` pairing runs; tells the client the name of its current room partner — see §11. |
-| `PartnerDitched`      | RemoteEvent     | Server → Client   | Fired by `handleEavesdrop()` to a Spy's original room partner the moment the Spy abandons them to go eavesdrop elsewhere — see §11. |
-| `StrikeIntercepted`   | RemoteEvent     | Server → Client   | Fired by `redirectToMartyr()` to the attacker (King/Usurper's executioner, or a Revolutionary) whose lethal strike was redirected onto a sworn Martyr instead of the intended target — see §11. |
-| `RoleRevealed`        | RemoteEvent     | Server → Client   | Fired by `handleBishopReveal()` to the Bishop only, carrying `(targetName, winCondition)` for whoever they just secretly scanned — see §13. |
+### 5.1 RemoteEvents / RemoteFunctions (`default.project.json`, under `ReplicatedStorage`)
 
-Plus the non-Remote `CurrentGameState` `StringValue`, which acts as a passive, poll-free broadcast channel: clients listen to its `Changed`/`GetPropertyChangedSignal("Value")` event rather than receiving a dedicated event per phase change.
+| Name | Type | Direction | Payload / Purpose |
+|---|---|---|---|
+| `RoleAssigned` | RemoteEvent | Server → Client | `(role: string)` — fired once per player in `assignRoles()`. |
+| `ActionRequest` | RemoteEvent | Client → Server | `(actionType: string, targetName: string?)`. `targetName` is required for every `actionType` except `"BishopReveal"`, which is fired with no second argument. Dispatches to: `"OrderMurder"`, `"OrderFakeMurder"`, `"MartyrOath"`, `"ConfirmExecution"`, `"Assassinate"`, `"Eavesdrop"`, `"BishopReveal"`, `"Accuse"`. |
+| `ExecutionPrompt` | RemoteEvent | Server → Client | `(targetName: string)` — fired to eligible Sorcerer/Knight players in `notifyExecutioners()`. |
+| `GetMyRole` | RemoteFunction | Client → Server | Invoked once at client start; returns the caller's `Role`, or `nil`. |
+| `AliveStatusUpdate` | RemoteEvent | Server → Client | Full snapshot array — see §5.2. |
+| `OrderVoided` | RemoteEvent | Server → Client | No args. Fired to an executioner whose order died with its requester, or a Usurper overridden by the King. |
+| `FakeOrderRevealed` | RemoteEvent | Server → Client | No args. Fired to the executioner right after a kill turns out to have been the Usurper's fake order. |
+| `RoomPartnerSync` | RemoteEvent | Server → Client | `(partnerName: string?)` — `""` for a solo player. Fired whenever `SecretMeetings` pairing runs. |
+| `PartnerDitched` | RemoteEvent | Server → Client | No args. Fired to a Spy's or Martyr's original room partner the moment they're abandoned. |
+| `StrikeIntercepted` | RemoteEvent | Server → Client | `(interceptorLabel: string, originalTargetName: string)`. **Dual-purpose** — see §5.3. |
+| `RoleRevealed` | RemoteEvent | Server → Client | `(targetName: string, winCondition: string)` — fired to the Bishop only. |
+| `GossipPing` | RemoteEvent | Server → Client | No args. Fired to a Peasant whose room partner is also a Peasant or a Double. |
+| `TribunalResult` | RemoteEvent | Server → Client | `(message: string, isKing: boolean)` — broadcast to everyone. |
+| `CrownInherited` | RemoteEvent | Server → Client | No args. Fired privately to a new crown-holder. |
 
-## 4. UI Architecture — State-Driven UI (`ActionController.client.luau`)
+Plus the non-Remote `CurrentGameState` `StringValue` (§3.2) — a passive, poll-free channel clients listen to via `GetPropertyChangedSignal("Value")`.
 
-The client menu system was refactored from ad-hoc `.Visible` toggling into a strict single-source-of-truth pattern to avoid race conditions as more role-specific menus are added:
+### 5.2 The `AliveStatusUpdate` snapshot
 
-- **`activeMenu`** (`local activeMenu = "None"`) is the *only* piece of state that determines what's on screen. Valid values currently: `"None"`, `"KingMurder"`, `"Executioner"`, `"Assassination"`, `"Usurper"`, `"Spy"`, `"Martyr"`, `"Bishop"`.
-- **`renderUI()`** is the *only* function in the script allowed to touch `.Visible`:
+`broadcastAliveStatus()` exists as **two independent, byte-identical implementations** (`GameLoop.server.luau` and `ActionHandler.server.luau` — a known duplication, not a shared helper; both were verified field-for-field identical as of this rewrite, after an earlier drift where the Bishop fields were added to only one copy and briefly desynced the client's cached values). Both compute `alivePeasantCount` and `isSorcererAlive` once per call (a separate loop over all players before the snapshot loop), then fire:
+
+```lua
+{
+    {
+        UserId = 123, Name = "Player1",
+        IsAlive = true,
+        Cooldown = 0,                    -- Usurper penalty, 0 if unset
+        ProtectedTarget = nil,           -- Martyr's ProtectedTargetUserId
+        BishopCooldown = 0,
+        ScannedPlayers = {},
+        LastTribunalDay = 0,             -- GameState-level, same for every entry
+        AlivePeasantCount = 3,           -- GameState-level, same for every entry
+        CurrentDay = 2,                  -- GameState-level, same for every entry
+        HasCrown = false,
+        IsSorcererAlive = true,          -- GameState-level, same for every entry
+    },
+    ...
+}
+```
+
+Every player's entry is included for shape-consistency, but each client only ever reads its own entry (matched by `UserId == localPlayer.UserId`) in `ActionController.client.luau`'s `AliveStatusUpdate.OnClientEvent` handler, caching the results into: `localProtectedTarget`, `localBishopCooldown`, `localScannedPlayers`, `localLastTribunalDay`, `localAlivePeasantCount`, `localCurrentDay` (falls back to its *previous* value rather than `1` if ever missing from a snapshot — so a malformed broadcast can't regress the client back to Day 1), `localHasCrown` (coerced with `== true`), and `localIsSorcererAlive` (coerced with `== true`). `aliveStatus`/`cooldownStatus` are separate parallel lookup tables built from *every* entry in the snapshot (not just the local player's), since those need to answer "is *any* given player alive" for menu population.
+
+### 5.3 `StrikeIntercepted` is dual-purpose
+
+Both call sites reuse the exact same remote and the exact same client-side banner template — *"YOUR STRIKE ON `<originalTargetName, upper>` WAS INTERCEPTED BY `<interceptorLabel, upper>`!"*:
+- **Martyr redirect** (`redirectToMartyr()`): `StrikeIntercepted:FireClient(attackerPlayer, martyrPlayer.Name, originalTargetPlayer.Name)` — reads naturally: *"...INTERCEPTED BY `<MARTYR NAME>`!"*
+- **Prince immunity** (`handleConfirmExecution()`): `StrikeIntercepted:FireClient(player, "THE PRINCE'S IMMUNITY", targetPlayer.Name)` — the "interceptor name" slot is filled with a literal phrase instead of a player name, producing: *"YOUR STRIKE ON `<PRINCE NAME>` WAS INTERCEPTED BY THE PRINCE'S IMMUNITY!"* — a deliberate reuse of the banner's placeholder structure rather than a second banner/remote.
+
+## 6. Client UI Controller (`ActionController.client.luau`)
+
+### 6.1 The `activeMenu` pattern
+
+- **`activeMenu`** (`local activeMenu = "None"`) is the *only* piece of state that determines what's on screen. Valid values: `"None"`, `"KingMurder"`, `"Executioner"`, `"Assassination"`, `"Usurper"`, `"Spy"`, `"Martyr"`, `"Bishop"`, `"Peasant"`.
+- **`renderUI()`** is the *only* function allowed to touch `.Visible`:
   ```lua
   local function renderUI()
+      if activeMenu == "Peasant" then
+          hasCastPeasantVote = false
+      end
+
       kingMurderAbility.Visible = (activeMenu == "KingMurder")
       executionerMenu.Visible = (activeMenu == "Executioner")
       assassinationMenu.Visible = (activeMenu == "Assassination")
@@ -132,210 +233,255 @@ The client menu system was refactored from ad-hoc `.Visible` toggling into a str
       spyMenu.Visible = (activeMenu == "Spy")
       martyrMenu.Visible = (activeMenu == "Martyr")
       bishopMenu.Visible = (activeMenu == "Bishop")
+      peasantMenu.Visible = (activeMenu == "Peasant")
   end
   ```
-- Every other piece of logic — the `CurrentGameState` listener (`updateVisibility`), the `ExecutionPrompt` handler, and the button click handlers — only ever *decides a new value for `activeMenu`* and then calls `renderUI()`. None of them touch frame `.Visible` directly, and the old blanket `hideAllMenus()` helper has been removed entirely.
-- Three additional pieces of client-local state feed into `updateVisibility()` beyond `aliveStatus`/`cooldownStatus`: **`currentRoomPartner`**, set by the `RoomPartnerSync.OnClientEvent` handler (coerced from `""`/`nil` to Lua `nil` — see §11); **`localProtectedTarget`**, extracted for the local player's own `UserId` out of every `AliveStatusUpdate` snapshot (see §8) — it mirrors the local player's server-side `ProtectedTargetUserId` and is what makes the Martyr menu's hide-after-oath behavior possible (see below); and **`localBishopCooldown`**/**`localScannedPlayers`**, extracted the same way, mirroring the Bishop's own `BishopCooldown`/`ScannedPlayers` — see §13.
+  The `hasCastPeasantVote` reset at the top is a deliberate piggyback (see §12.5) — every time the Peasant menu becomes visible, a fresh voting window has begun, so resetting the "did I vote this window" flag lives in the same place the menu itself turns on.
+- Every other piece of logic — `updateVisibility()`, the `ExecutionPrompt` handler, and every button click handler — only ever *decides* a new `activeMenu` value and then calls `renderUI()`. Nothing else touches `.Visible`.
 
-State transitions:
-- **`updateVisibility()`** (bound to `CurrentGameState:GetPropertyChangedSignal("Value")`, and also called once at script init): lowercases the current state string and applies, in order:
-  - if it contains `"secret"` and the local player's role is `"King"` → `activeMenu = "KingMurder"` (and repopulates the target `playerList`).
-  - else if it contains `"secret"` and the local player's role is `"Spy"` → `activeMenu = "Spy"` (and repopulates `spyTargetList` via `populateSpyList()` — see §11).
-  - else if it contains `"secret"` and the local player's role is `"Martyr"` **and** `localProtectedTarget == nil` → `activeMenu = "Martyr"` (and repopulates `martyrTargetList` via `populateMartyrList()` — see §11). Once the oath is sworn, `localProtectedTarget` becomes non-`nil` on the next `AliveStatusUpdate` and this branch permanently stops matching for the rest of the game — no branch below it matches a Martyr either, so the menu falls through to `"None"` and never reopens.
-  - else if it contains `"secret"` and the local player's role is `"Bishop"` **and** `localBishopCooldown == 0` **and** `currentRoomPartner ~= nil` **and not** `bishopPartnerAlreadyScanned` → `activeMenu = "Bishop"` — see §13 for how `bishopPartnerAlreadyScanned` is computed and why there's no `populateBishopList()` call here.
-  - else if it contains `"night"` and the local player's role is `"Revolutionary"` → `activeMenu = "Assassination"` (and repopulates `targetList`).
-  - else if it contains `"night"` **and** `activeMenu` is already `"Executioner"` → leave `activeMenu` untouched, so an execution prompt that just opened isn't slammed shut by the same state-change tick.
-  - else if it contains `"day gathering"` (an exact-phrase match, so it doesn't also fire on `"evening gathering"`) and the local player's role is `"Usurper"` and their `Cooldown` is `0`/`nil` → `activeMenu = "Usurper"` (and repopulates `usurperTargetList`).
-  - else → `activeMenu = "None"`.
-- **`ExecutionPrompt.OnClientEvent`**: stores `pendingExecutionTarget`, sets `activeMenu = "Executioner"`, updates `targetDisplay.Text`, calls `renderUI()`.
-- **`submitButton.MouseButton1Click`** (King confirms a murder target): fires `ActionRequest("OrderMurder", ...)`, then `activeMenu = "None"`, `renderUI()`.
-- **`confirmKillButton.MouseButton1Click`** (Executioner confirms the kill): fires `ActionRequest("ConfirmExecution", ...)`, then `activeMenu = "None"`, `renderUI()`.
-- **`assassinateButton.MouseButton1Click`** (Revolutionary confirms a target): fires `ActionRequest("Assassinate", ...)`, then `activeMenu = "None"`, `renderUI()`.
-- **`fakeOrderButton.MouseButton1Click`** (Usurper confirms a fake target): fires `ActionRequest("OrderFakeMurder", ...)`, then `activeMenu = "None"`, `renderUI()`.
-- **`eavesdropButton.MouseButton1Click`** (Spy confirms an eavesdrop target): fires `ActionRequest("Eavesdrop", ...)`, then `activeMenu = "None"`, `renderUI()`.
-- **`oathButton.MouseButton1Click`** (Martyr swears their oath): fires `ActionRequest("MartyrOath", ...)`, then `activeMenu = "None"`, `renderUI()`. (The menu would have hidden itself on the next `AliveStatusUpdate` regardless — see above — but this avoids a one-frame flash of a now-stale menu.)
-- **`revealButton.MouseButton1Click`** (Bishop scans their room partner): fires `ActionRequest:FireServer("BishopReveal")` with **no** second argument (unlike every other action button — see §3's `ActionRequest` row), then `activeMenu = "None"`, `renderUI()`. There's no `selectedX`/`resetXButtonColors()` pair for the Bishop, since there's nothing to select — see §13.
-- Script init calls both `updateVisibility()` (to evaluate current state/role immediately, e.g. on late join) and `renderUI()` (to paint the resulting `activeMenu`).
+### 6.2 Client-local state mirrored from the server
 
-This design means adding a new role-specific menu is a matter of adding one more `activeMenu` value and one more line in `renderUI()` — no new `hideAllMenus()`-style call sites are needed anywhere else.
+Beyond `aliveStatus`/`cooldownStatus`: `currentRoomPartner` (from `RoomPartnerSync`, coerced `""`/`nil` → Lua `nil`), and everything listed in §5.2 (`localProtectedTarget`, `localBishopCooldown`, `localScannedPlayers`, `localLastTribunalDay`, `localAlivePeasantCount`, `localCurrentDay`, `localHasCrown`, `localIsSorcererAlive`), plus the purely-local `hasCastPeasantVote`.
 
-## 5. Completed Mechanics — King → Executioner Murder Loop
+### 6.3 `updateVisibility()` — the full branch chain
 
-End-to-end flow, currently working:
+Bound to `CurrentGameState:GetPropertyChangedSignal("Value")`, and called once at script init. Lowercases the state string, then evaluates in order:
 
-1. **Role assignment**: on reaching 3+ players, `assignRoles()` hands out roles from the `ROLES` list (with `Player1`/`Player2`/`Player3` test-rigged to King/Sorcerer/Usurper respectively for solo testing), populating `PlayerData` and firing `RoleAssigned` to each client.
-2. **Order phase (`SecretMeetings`)**: the King's client shows the `KingMurderAbility` menu (via `activeMenu = "KingMurder"`), lists other players, and on submit fires `ActionRequest("OrderMurder", targetName)`. Server-side, `handleOrderMurder()` validates the state, the caller's role, and the target, then writes `PendingActions.ActiveMurder = { RequesterRole = "King", Target = targetName, RequesterId = kingUserId }` (see §10 for what happens if a Usurper order was already sitting there).
-3. **Night transition**: `notifyExecutioners()` runs when `NightPhase` begins, reads `PendingActions.ActiveMurder`, and fires `ExecutionPrompt` to every connected Sorcerer/Knight with the target's name. `PendingActions` is cleared later, on the `NightPhase → DayGathering` transition.
-4. **Execution prompt (client)**: any Sorcerer/Knight client receiving `ExecutionPrompt` sets `activeMenu = "Executioner"`, displaying the `ExecutionerMenu` with the target's name — protected from being immediately hidden by the `NightPhase` state-change tick via the `updateVisibility()` preserve-if-already-open rule.
-5. **Confirmation**: clicking `ConfirmKill` fires `ActionRequest("ConfirmExecution", targetName)`. Server-side, `handleConfirmExecution()` validates the state is `NightPhase`, the caller is Sorcerer/Knight and alive, confirms `PendingActions.ActiveMurder.Target` still matches, sets the target's `Humanoid.Health = 0`, marks `PlayerData[target].IsAlive = false`, and clears `ActiveMurder` — with an extra reveal step if the order turns out to have been the Usurper's fake one (see §10).
+```lua
+if string.find(stateLower, "secret") and localHasCrown == true then
+    activeMenu = "KingMurder"; populatePlayerList()
+elseif string.find(stateLower, "secret") and localPlayerRole == "Spy" then
+    activeMenu = "Spy"; populateSpyList()
+elseif string.find(stateLower, "secret") and localPlayerRole == "Martyr" and localProtectedTarget == nil then
+    activeMenu = "Martyr"; populateMartyrList()
+elseif string.find(stateLower, "secret") and localPlayerRole == "Bishop"
+    and localBishopCooldown == 0 and currentRoomPartner ~= nil and not bishopPartnerAlreadyScanned then
+    activeMenu = "Bishop"
+elseif string.find(stateLower, "evening") and localPlayerRole == "Peasant"
+    and localCurrentDay > 1 and localCurrentDay > (localLastTribunalDay + 1) and localAlivePeasantCount >= 3 then
+    activeMenu = "Peasant"; populatePeasantList()
+elseif string.find(stateLower, "night") and localPlayerRole == "Revolutionary" then
+    activeMenu = "Assassination"; populateAssassinationList()
+elseif string.find(stateLower, "night") and activeMenu == "Executioner"
+    and (localPlayerRole == "Sorcerer" or (localPlayerRole == "Knight" and localIsSorcererAlive == false)) then
+    -- Do nothing, preserve the menu
+elseif string.find(stateLower, "day gathering") and localPlayerRole == "Usurper"
+    and localCooldown == 0 and not localHasCrown then
+    activeMenu = "Usurper"; populateUsurperList()
+else
+    activeMenu = "None"
+end
 
-Diagnostic logging (added during debugging) remains in place in `notifyExecutioners()` (dumps `PendingActions.ActiveMurder` and every player's role) to make future King/Executioner desync issues easy to trace.
+renderUI()
+```
 
-## 6. Ghost & Respawn System
+Key details:
+- **The King branch checks `localHasCrown == true`, not `localPlayerRole == "King"`.** This is what makes the King's Murder menu "follow the crown" through succession without any role-specific code — see §13.4.
+- **The Martyr branch** permanently stops matching once `localProtectedTarget` becomes non-`nil` (oath sworn) — no later branch matches a Martyr either, so the menu falls through to `"None"` and never reopens.
+- **The Bishop branch** precomputes `bishopPartnerAlreadyScanned` just above the chain (resolves `currentRoomPartner`'s `Player` via `Players:FindFirstChild`, checks `table.find(localScannedPlayers, partnerPlayer.UserId)`) — mirrors the server's validation client-side so the menu only appears when a reveal would actually succeed.
+- **The Executioner "preserve" branch does not *open* the menu** — that only happens via `ExecutionPrompt.OnClientEvent` (server-triggered). This branch only decides whether an *already-open* Executioner menu survives the `NightPhase` state-change tick; the role/`localIsSorcererAlive` condition mirrors the server's Knight Lockout (§8.2) so a Knight menu opened while a Sorcerer was still alive won't be artificially kept open either.
+- **The Usurper branch requires `not localHasCrown`** in addition to its original `Cooldown == 0` gate — once a Usurper inherits the crown, this branch stops matching (see §13.3), and the King branch above takes over on the next `SecretMeetings`.
+- A `local currentDay` used to be parsed here via `string.match(CurrentGameState.Value, "Day (%d+)")` — that line and every reference to it were removed entirely; `localCurrentDay` (server-synced, see §5.2) is used instead.
 
-Dead players stay in the game as visible-to-themselves, invisible-to-the-living "ghosts." This is split across a server-side physics layer and a client-side visuals layer — they solve different problems and don't depend on each other.
+### 6.4 `showTemporaryBanner` and its colors
+
+```lua
+local function showTemporaryBanner(name: string, text: string, duration: number, color: Color3?)
+```
+
+`color` defaults to `BANNER_TEXT_COLOR` (red) when omitted. Palette in use:
+
+| Constant | RGB | Used by |
+|---|---|---|
+| `BANNER_TEXT_COLOR` | `255, 0, 0` (red) | `OrderVoided`, `FakeOrderRevealed`, `PartnerDitched`, `StrikeIntercepted`, `TribunalResult` (non-King verdict) |
+| `BANNER_SUCCESS_COLOR` | `0, 200, 0` (green) | `RoleRevealed`, `TribunalResult` (King exposed) |
+| `BANNER_INFO_COLOR` | `130, 150, 190` (blue-gray) | `GossipPing` |
+| `BANNER_GRAY_COLOR` | `160, 160, 160` (gray) | Tribunal void banner (§12.5) |
+| `BANNER_GOLD_COLOR` | `212, 175, 55` (gold) | `CrownInherited` |
+
+Each banner is name-keyed (`actionUI:FindFirstChild(name)`) so re-firing the same banner destroys and replaces the previous instance instead of stacking.
+
+## 7. Ghost & Respawn System
+
+Dead players stay in-game as visible-to-themselves, invisible-to-the-living "ghosts," split across a server physics layer and a client visuals layer that don't depend on each other.
 
 **Server (`GameLoop.server.luau`) — collision:**
-- At script start, `PhysicsService:RegisterCollisionGroup(...)` creates two groups, `"Alive"` and `"Ghosts"` (wrapped in `pcall` since re-registering an existing group errors on script re-run), then `PhysicsService:CollisionGroupSetCollidable("Alive", "Ghosts", false)` makes them mutually non-collidable.
-- `applyGhostState(character)` — called from `catchRespawn()` whenever `PlayerData[player.UserId].IsAlive == false` on `CharacterAdded` — sets every `BasePart`'s `CollisionGroup = "Ghosts"` *and* `CanCollide = false` (belt-and-suspenders: `CanCollide` alone wasn't sufficient because Roblox's Humanoid/rig-building code can reset it on limbs after `CharacterAdded`, whereas the `CollisionGroup` assignment survives that reset). It also disables every `BillboardGui` (e.g. nametags) and sets `Humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None` so the ghost doesn't render in other players' nameplate/health-bar UI.
-- `applyAliveState(character)` — the else-branch of `catchRespawn()` — sets `CollisionGroup = "Alive"` on every `BasePart` for a player who is (re)spawning alive.
-- `catchRespawn()` is hooked on every player's `CharacterAdded` from script start plus `Players.PlayerAdded`, so it runs for every respawn, not just the first spawn.
+- At script start: two `PhysicsService` collision groups, `"Alive"` and `"Ghosts"` (registration wrapped in `pcall`, since re-registering an existing group errors on script re-run), made mutually non-collidable.
+- `applyGhostState(character)` (from `catchRespawn()` when `PlayerData[userId].IsAlive == false` on `CharacterAdded`): sets every `BasePart`'s `CollisionGroup = "Ghosts"` **and** `CanCollide = false` (belt-and-suspenders — Roblox's rig-building code can reset `CanCollide` on limbs after `CharacterAdded`, but not `CollisionGroup`); disables every `BillboardGui`; sets `Humanoid.DisplayDistanceType = None`.
+- `applyAliveState(character)`: the else-branch, sets `CollisionGroup = "Alive"` for a (re)spawning-alive player.
+- `catchRespawn()` is hooked on every player's `CharacterAdded` (both at script start and via `Players.PlayerAdded`), so it fires on every respawn, not just the first.
 
 **Client (`ActionController.client.luau`) — visuals:**
-- `updateGhostVisibility()` is the single function that owns ghost transparency. For every player who is dead (per the client's `aliveStatus` table), it calls `setCharacterTransparency(character, transparency)`, which sets `Transparency` on every `BasePart`/`Decal` descendant. The transparency value depends on the *viewer*: `LIVING_VIEW_OF_DEAD_TRANSPARENCY = 1` (fully invisible) if the local player is alive, `DEAD_VIEW_OF_DEAD_TRANSPARENCY = 0.5` (translucent) if the local player is also dead — so ghosts can see each other and themselves, but the living see nothing.
-- A separate explicit block handles the local player's *own* dead character: it calls both `setCharacterTransparency` and `setLocalTransparencyModifier` (which sets `LocalTransparencyModifier` on every `BasePart`). The modifier is required because Roblox's default camera/occlusion scripts (the ones that fade out parts blocking the camera) can silently override a plain `Transparency` write on the local client's own character — `LocalTransparencyModifier` is the property those scripts actually respect for the local avatar.
-- Both the main loop and the local-player block guard every character lookup with `if character and character.Parent then` before touching descendants, so a character that's mid-destruction (e.g. respawning at that exact instant) is skipped instead of erroring on stale/unparented instances.
-- Visibility updates fire two ways: reactively, whenever `AliveStatusUpdate` lands (so a death/revive updates visuals immediately), and via a **1-second polling loop** — `task.spawn(function() while task.wait(1) do updateGhostVisibility() end end)` at the bottom of the script. The polling loop exists because earlier event-driven approaches (`CharacterAppearanceLoaded`, `DescendantAdded` listeners for late-streamed accessories/limbs) proved to race with Roblox's asset streaming and produced an intermittent "opaque ghost" bug; polling trades a little latency (worst case ~1s) for a guarantee that any part that exists gets corrected shortly after it loads, with no event-ordering assumptions.
+- `updateGhostVisibility()` sets `Transparency` on every dead player's `BasePart`/`Decal` descendants: fully invisible (`1`) if the local player is alive, translucent (`0.5`) if the local player is also dead — ghosts see each other and themselves; the living see nothing.
+- The local player's *own* dead character additionally gets `LocalTransparencyModifier` set (not just `Transparency`) — Roblox's default camera/occlusion scripts silently override plain `Transparency` on the local avatar, but respect `LocalTransparencyModifier`.
+- Both blocks guard with `if character and character.Parent then` to skip mid-destruction characters.
+- Fires reactively on every `AliveStatusUpdate`, plus a **1-second polling loop** (`task.spawn(function() while task.wait(1) do updateGhostVisibility() end end)`) — polling exists because earlier event-driven approaches raced Roblox's asset streaming and produced an intermittent "opaque ghost" bug.
 
-## 7. Chat Filtering — Graveyard & Spy Eavesdropping
+## 8. The Crown & Executioners
 
-All players share the same `RBXGeneral` text channel — there is no separate `"Graveyard"` `TextChannel`, no per-room `TextChannel`, and no channel-switching (`AddUserAsync`/`RemoveUserAsync`) anywhere. Every filtering rule (ghosts, room privacy, Spy eavesdropping) is enforced purely at delivery time, per sender/recipient pair, by a single `ShouldDeliverCallback`.
+### 8.1 King / Usurper murder orders
 
-**Server (`ChatFilter.server.luau`):**
-- `local textChannels = TextChatService:WaitForChild("TextChannels")` then `textChannels:WaitForChild("RBXGeneral")` — both use `WaitForChild` because the engine creates its default `TextChannels` folder asynchronously; indexing `TextChatService.TextChannels` directly can run before it exists and throw `"TextChannels is not a valid member of TextChatService"`.
-- `generalChannel.ShouldDeliverCallback = function(textChatMessage, targetTextSource) ... end` is set once at script start and runs once per `(sender, recipient)` pair for every message. It looks up `GameState.PlayerData[senderUserId]` and `GameState.PlayerData[targetUserId]`; if either is missing (e.g. chat before roles are assigned), it fails open and returns `true`. The remaining logic runs in this order:
-  1. **Ghost filter** (all phases): if the sender's `IsAlive == false` and the recipient's `IsAlive == true`, it `print("[CHAT FILTER] Blocked ghost message to living player")` and returns `false` — a dead player's message is invisible to any living recipient, in every game phase, regardless of room/pairing state.
-  2. **Room privacy + Spy eavesdropping** (`SecretMeetings` only — everything below is skipped entirely outside this phase, so normal Day/Evening/Night chat is unrestricted aside from the ghost filter):
-     ```lua
-     local spyTarget = GameState.SpyTarget
+- **King's real order** (`handleOrderMurder()`, `SecretMeetings` only): gated on `requesterData.HasCrown == true` — **not** `Role == "King"` (see §13.3). If a Usurper's fake order is currently active, `OrderVoided` fires to that Usurper before the King's order overwrites it.
+- **Usurper's fake order** (`handleFakeMurder()`, `DayGathering` only): gated on `Role == "Usurper"`, alive, **and** `HasCrown ~= true` (a crowned Usurper is blocked server-side, not just client-side — see §13.3). If a King's order is already active, the attempt is rejected and `OrderVoided` fires immediately back to the Usurper.
+- **The executioner never knows which is which up front** — `ExecutionPrompt` only carries a target name. The distinction surfaces only in `handleConfirmExecution()`, *after* a kill lands: if `activeMurder.RequesterRole == "Usurper"`, `FakeOrderRevealed` fires to the executioner and `PlayerData[RequesterId].Cooldown = 3` — three `tickCooldowns()` ticks (three `NightPhase → DayGathering` transitions) before the Usurper's menu (gated on `Cooldown == 0`) reopens.
 
-     if senderData.Role == "Spy" and spyTarget ~= nil then
-         return false
-     end
+### 8.2 Sorcerer execution, Knight Lockout, Prince immunity
 
-     if targetData.Role == "Spy" and spyTarget ~= nil then
-         if senderId == spyTarget then
-             return true
-         end
-         if senderId == GameState.SecretPairs[spyTarget] then
-             return true
-         end
-         return false
-     end
+`handleConfirmExecution()` (`NightPhase` only, caller must be `Sorcerer` or `Knight`) validates, in order:
+1. Caller role is `Sorcerer` or `Knight`.
+2. **Knight Lockout**: if the caller is a `Knight`, scan all connected players for a living `Sorcerer`; if one exists, return immediately — the Knight is a **backup executioner only**, unable to act while the Sorcerer lives.
+3. Caller `IsAlive`.
+4. `PendingActions.ActiveMurder` exists and matches `targetName`.
+5. Target resolves to a connected `Player` with a `Humanoid`.
+6. **Martyr redirect check** (`findLivingMartyrProtecting()`/`redirectToMartyr()` — see §11.2) — takes priority over the Prince check below; if a Martyr intercepts, the function returns here.
+7. **Prince immunity**: `if requesterData.Role == "Sorcerer" and targetData.Role == "Prince"` — fires `StrikeIntercepted` (§5.3) and returns, **without** killing the Prince. This check is Sorcerer-specific: a Knight's strike is *not* blocked by it, so once the Knight becomes the active executioner (Sorcerer dead), they genuinely can kill a Prince a Sorcerer's magic couldn't touch. (An earlier version blocked *any* executor from killing a Prince — that blanket check was removed specifically to make the Knight Lockout/backup-executioner design mechanically meaningful.)
+8. Otherwise: `humanoid.Health = 0`, `targetData.IsAlive = false`, `handleRoyalSuccession(targetPlayer.UserId)` (§13.1), then the Usurper-reveal bookkeeping (`FakeOrderRevealed`/`Cooldown = 3` if applicable), clear `ActiveMurder`, `broadcastAliveStatus()`.
 
-     if senderData.IsAlive == true and targetData.IsAlive == true then
-         if GameState.SecretPairs[senderId] == targetId then
-             return true
-         end
-     end
+The Revolutionary's `handleAssassination()` (`NightPhase`, instant, no `ExecutionPrompt` round-trip) follows the same Martyr-redirect-first, then-kill, then-`handleRoyalSuccession()` shape, but has **no** Prince-immunity check at all — a Revolutionary can kill a Prince outright. It also carries its own **Rule of Chronology**: if the just-killed player was the `RequesterId` of the night's `PendingActions.ActiveMurder`, that order dies with them (cleared, and `OrderVoided` fired to every Sorcerer/Knight) so an open `ExecutionPrompt` doesn't get actioned on a dead man's orders.
 
-     return false
-     ```
-     - **Baseline room privacy**: during `SecretMeetings`, two living players can hear each other only if they're each other's current room partner (`GameState.SecretPairs[senderId] == targetId`, the same bidirectional map `pairPlayersInRoom()` writes — see §11). Any other living-to-living pair falls through to the final `return false`, so cross-room chat is blocked entirely during this phase.
-     - **The Spy's own messages are silent** whenever they've actively infiltrated a room (`GameState.SpyTarget ~= nil`, set by `handleEavesdrop()` — see §11): `senderData.Role == "Spy" and spyTarget ~= nil` returns `false` unconditionally, for every recipient. This is what makes eavesdropping *read-only* — the Spy is physically standing in someone else's private conversation, invisible and silent, not an active third participant.
-     - **The Spy hears exactly the infiltrated pair, and no one else**: when the *recipient* being evaluated is the Spy (`targetData.Role == "Spy"`) and `spyTarget ~= nil`, delivery is allowed only if the sender is the eavesdropped-on player (`senderId == spyTarget`) or that player's original room partner (`senderId == GameState.SecretPairs[spyTarget]`) — i.e. the two people actually in the room the Spy pivoted into. Every other sender is denied, so the Spy can't accidentally overhear unrelated rooms just by being alive during `SecretMeetings`.
-     - Because `GameState.SpyTarget` is a single value (not a list), only one room can be under active surveillance at a time — consistent with there being exactly one `Spy` role in `ROLES`.
-- Because this runs per-recipient at the engine's delivery layer, it doesn't matter which channel a client's `ChatInputBarConfiguration.TargetTextChannel` happens to be pointed at — filtering is enforced server-side regardless of client UI state.
-- `GameState.SpyTarget` is reset to `nil` (and `GameState.SecretPairs` cleared) on the `SecretMeetings → EveningGathering` transition in `GameLoop.server.luau` (see §2), so the eavesdropping/room-privacy branch above only ever evaluates non-`nil` state while `SecretMeetings` is actually active.
+## 9. Chat Filtering (`ChatFilter.server.luau`)
 
-**Client (`ActionController.client.luau`):** the `AliveStatusUpdate` handler detects the local player's own alive→dead transition (`wasLocalPlayerAlive and not isPlayerAlive(localPlayer)`) and calls `TextChatService.TextChannels.RBXGeneral:DisplaySystemMessage(...)` with a red-tagged message: *"Welcome to the Graveyard chat. The living cannot hear you."* This is a purely local system message (not an actual chat message), so it only ever appears in that one client's own chat window. There is no equivalent client-side system message for the Spy — eavesdropping is silent by design, so the Spy gets no special chat UI beyond simply receiving the infiltrated room's messages.
+All players share one `RBXGeneral` text channel — no separate `"Graveyard"` channel, no per-room channel, no channel-switching. Every rule (ghosts, room privacy, Spy eavesdropping, Martyr's third-wheel room) is enforced per-recipient by a single `ShouldDeliverCallback`, evaluated in this order:
 
-## 8. UI State Syncing
+1. **Ghost filter** (all phases): dead sender → living recipient is always blocked, everywhere, regardless of room state.
+2. **Room privacy + Spy + Martyr** (`SecretMeetings` only — outside this phase, only the ghost filter applies):
+   - **Spy silence**: if the sender is the actively-eavesdropping Spy (`GameState.SpyTarget ~= nil`), their message is blocked for *everyone*, unconditionally — eavesdropping is read-only.
+   - **Spy's inbox**: if the recipient is the actively-eavesdropping Spy, delivery is allowed only from the eavesdropped-on player (`senderId == spyTarget`) or that player's original partner (`senderId == GameState.SecretPairs[spyTarget]`) — exactly the two people in the infiltrated room, no one else.
+   - **Martyr's outbox**: if the sender is an oathbound Martyr (`ProtectedTargetUserId ~= nil`), delivery is allowed only to their protected target or that target's `SecretPairs` partner — an explicit `return false` for everyone else, so this can never fall through to the general pairing check below (a fix for a prior leak where it could).
+   - **Martyr's inbox**: mirror of the above — if the recipient is an oathbound Martyr, delivery is allowed from their protected target or that target's partner. (Note: unlike the Martyr's outbox, this branch has no trailing `else return false` — a non-matching sender falls through to the general pairing check below instead of being explicitly denied here.)
+   - **General pairing**: two living players can hear each other only if `GameState.SecretPairs[senderId] == targetId` (current room partners).
+   - Anything not matched by the above: `return false`.
+3. Outside `SecretMeetings`: always `return true` (subject to the ghost filter above).
 
-`AliveStatusUpdate` is the single channel clients use to learn who's alive and whose ability is on cooldown. `broadcastAliveStatus()` exists in both `GameLoop.server.luau` and `ActionHandler.server.luau` (kept as two independent, identically-shaped implementations — a known duplication, not a shared helper) and fires:
+`GameState.SpyTarget` is reset and `SecretPairs` cleared on the `SecretMeetings → EveningGathering` transition, so branch 2 only ever evaluates meaningfully while `SecretMeetings` is actually active.
 
-```lua
-{
-    { UserId = 123, Name = "Player1", IsAlive = true, Cooldown = 0, ProtectedTarget = nil, BishopCooldown = 0, ScannedPlayers = {} },
-    ...
-}
-```
+**Client**: the local player's alive→dead transition triggers a local-only system message in `RBXGeneral`: *"Welcome to the Graveyard chat. The living cannot hear you."* No equivalent message exists for the Spy or Martyr — both mechanics are silent by design.
 
-Both copies were briefly out of sync — `ActionHandler.server.luau`'s went unpatched when the Bishop fields were first added to `GameLoop.server.luau`'s, so a broadcast fired right after `handleConfirmExecution()`/`handleAssassination()` landed a kill would momentarily reset the client's cached `localBishopCooldown`/`localScannedPlayers` to their zero-values. Both copies now include `BishopCooldown`/`ScannedPlayers` and are back in sync — if a third `broadcastAliveStatus()` implementation is ever added, or either of these two is extended again, keep the field lists identical, since nothing enforces that structurally.
+## 10. Phase A — The Room Crashers
 
-`ProtectedTarget` mirrors that player's `PlayerData.ProtectedTargetUserId` — `nil` for everyone except a Martyr who has sworn their oath, in which case it's the `UserId` they're protecting. `BishopCooldown`/`ScannedPlayers` mirror the like-named `PlayerData` fields — see §13. The client only ever reads its own entry's fields (see §4/§11/§13), but the server includes every player's for shape-consistency with the rest of the snapshot.
+### 10.1 The Spy
 
-The client stores this into two parallel lookup tables, `aliveStatus: {[UserId]: boolean}` and `cooldownStatus: {[UserId]: number}`. `isPlayerAlive(player)` defaults to `true` for any `UserId` not yet present (e.g. before the first broadcast lands); cooldown reads default to `0` the same way (`cooldownStatus[UserId] or 0`). `localProtectedTarget` (a plain local, not a table) is overwritten every broadcast from whichever snapshot entry matches `localPlayer.UserId`.
+Trades their own `SecretMeetings` pairing for the ability to physically relocate into someone else's room, invisible, and read that room's chat.
 
-The four target-selection menus share a common shape — `populatePlayerList()` (King), `populateAssassinationList()` (Revolutionary), `populateUsurperList()` (Usurper), and `populateSpyList()` (Spy) — with two deliberate variations:
-1. Destroy any previously-spawned target buttons and clear a previous `"NoValidTargetsLabel"` (looked up and destroyed by that fixed name, so it never stacks across repopulations).
-2. Loop `Players:GetPlayers()`, filtering to `player ~= localPlayer and isPlayerAlive(player)`, spawning one `TextButton` per valid target and counting them. `populateSpyList()` adds one more filter on top — it `continue`s past whichever player's name equals `currentRoomPartner`, since eavesdropping on the room you're already in isn't a meaningful action.
-3. If the count is `0`: disable the menu's action button (`Active = false`, `AutoButtonColor = false`, via the shared `setActionButtonEnabled` helper) and spawn a `"NO VALID TARGETS"` `TextLabel` (red-gray, `Color3.fromRGB(200, 60, 60)`) into the list container. If the count is `> 0`, the button is (re-)enabled — so a menu that was previously empty doesn't stay stuck disabled once valid targets exist again.
+- **Room partner tracking**: `runSecretMeetings()` → `pairPlayersInRoom()` writes both directions of `GameState.SecretPairs` and fires `RoomPartnerSync` to each of the pair (solo player gets `""`). Client stores as `currentRoomPartner`.
+- **`handleEavesdrop()`** (`SecretMeetings`, alive Spy, valid target with resolvable `HumanoidRootPart`s on both sides):
+  1. Notifies the Spy's *current* partner via `PartnerDitched` (doesn't touch `SecretPairs` — it's a notification, not a re-pairing).
+  2. Teleports: `spyCharacter:PivotTo(targetRoot.CFrame * CFrame.new(0, 5, 0))`.
+  3. `applySpyInvisibility()`: every `BasePart` → `Transparency = 1`, `CollisionGroup = "Spies"` (a third collision group, non-collidable with `"Alive"`, registered alongside `"Alive"`/`"Ghosts"`); every `Decal` → `Transparency = 1`; every `BillboardGui` → disabled.
+  4. `hookSpyDescendantListener()`: a `DescendantAdded` connection (stored per-player in `GameState.SpyConnections`, replacing any prior one) applies the same treatment to late-streamed accessories/limbs.
+  5. `GameState.SpyTarget = targetPlayer.UserId` — the flag `ChatFilter.server.luau` reads (§9).
+- **Cleanup**: on `SecretMeetings → EveningGathering`, every living Spy has invisibility/collision restored (`HumanoidRootPart` stays `Transparency = 1`, matching default character behavior) and their `SpyConnections` entry disconnected.
+- **Client list** (`populateSpyList()`): the standard all-alive-except-self shape, plus one extra filter excluding `currentRoomPartner`.
 
-`populateMartyrList()` (Martyr — see §11) does **not** follow this shape: rather than looping every living player, it builds at most one button, for whichever player's name matches `currentRoomPartner` (looked up via `Players:FindFirstChild`, filtered to alive and not the local player). This is a deliberate restriction, not a filtered version of the general list — the oath can only ever target the Martyr's current room partner, so there is never more than one valid choice to present.
+### 10.2 The Martyr
 
-## 9. Role Mechanics — Revolutionary
+A one-time, irrevocable oath to protect their *current* room partner at the time of swearing (target selection is now unrestricted — see below) — but the physical/data effects still key off whoever they *targeted*, regardless of pairing.
 
-The Revolutionary's `Assassinate` action (`handleAssassination()` in `ActionHandler.server.luau`) is deliberately **not** a two-step order/confirm flow like the King/Executioner pair — it validates `NightPhase`, that the caller is an alive `Revolutionary`, and that the target exists and isn't the caller, then immediately sets `Humanoid.Health = 0` and `PlayerData[target].IsAlive = false` in the same call. There's no `ExecutionPrompt` round trip, so the kill always lands the instant the Revolutionary submits it that night.
+- **`handleMartyrOath()`** (`SecretMeetings`, alive Martyr, `ProtectedTargetUserId == nil`, `type(targetName) == "string"`): resolves the target (any alive player — **not** restricted to the current partner, an earlier restriction that was lifted), notifies the old partner via `PartnerDitched`, severs both directions of the old `SecretPairs` entry (`GameState.SecretPairs[player.UserId] = nil` and the partner's mirror — a fix for a chat-leak where the abandoned partner's stale pairing kept letting their messages reach the Martyr), teleports the Martyr to the target's room (`PivotTo`, same 5-stud-above trick as the Spy — **no** invisibility applied, the Martyr stays fully visible), then sets `ProtectedTargetUserId = targetPlayer.UserId` permanently.
+- **Third Wheel forced matchmaking** (`runSecretMeetings()`, every day after the standard pairing pass): for any alive Martyr with a non-`nil` `ProtectedTargetUserId`, resolves the protected player; if alive, severs the Martyr's current `SecretPairs` entry (same leak-prevention as above) and teleports the Martyr (`PivotTo`) into wherever the protected target ended up that day's standard pairing — **not** a forced pairing anymore (an earlier version pulled both out of the pool early and force-paired them into `Room1`; that was replaced so the target gets a normal partner and the Martyr shows up as an uninvited third person).
+- **The Night Sacrifice**: `findLivingMartyrProtecting(targetUserId)` is checked by both `handleConfirmExecution()` and `handleAssassination()` immediately before applying lethal damage. If found, `redirectToMartyr()` kills the **Martyr** instead (`Humanoid.Health = 0`, `IsAlive = false`), fires `StrikeIntercepted` to the attacker only (§5.3), and both call sites otherwise run their normal post-kill bookkeeping as if the *original* target had died (Usurper-reveal logic still fires based on who *ordered* the kill, not who died). A dead Martyr can never intercept again (`findLivingMartyrProtecting()` filters `IsAlive == true`).
+- **Chat**: see §9 — the Martyr's room is a "third wheel" chat scenario, symmetric to (but independent of) the Spy's.
+- **Client list** (`populateMartyrList()`): the standard all-alive-except-self shape (matches the Spy's, minus the partner exclusion) — mirrors the unrestricted-target design above.
 
-**Rule of Chronology**: because the kill is instantaneous, it's possible for the Revolutionary's target to be the very player who placed the night's `PendingActions.ActiveMurder` (a King or a Usurper). After the kill lands, `handleAssassination()` checks `activeMurder.RequesterId == targetPlayer.UserId` — if the order's *requester* just died, the order dies with them: `PendingActions.ActiveMurder` is cleared and `OrderVoided` is fired to every connected Sorcerer/Knight, so an executioner who already has an `ExecutionPrompt` open for that now-orphaned order gets told to stand down instead of executing on a dead man's orders.
+### 10.3 The Bishop
 
-## 10. Usurper & King Precedence
+A stealthy, cooldown-gated ability revealing which win condition their *current room partner* is fighting for, without ever notifying the target.
 
-`PendingActions.ActiveMurder` is a single slot (not keyed by `UserId`) precisely because only one murder order can be "the" active order heading into `NightPhase` — the King's order always wins if both are placed the same day, and the data structure enforces that by only ever holding one entry:
+- **Data**: `BishopCooldown`/`ScannedPlayers` initialized in `assignRoles()`; `BishopCooldown` decremented by a dedicated per-day loop in `GameLoop.server.luau`'s `DayGathering` branch (not `tickCooldowns()`).
+- **`handleBishopReveal(player)`** — fired with **no** `targetName` (`ActionRequest:FireServer("BishopReveal")`, requiring the dispatcher's top-level guard to accept a `nil` targetName — see §5.1): `SecretMeetings`, alive Bishop, `BishopCooldown == 0`. Target is resolved implicitly: `targetId = GameState.SecretPairs[player.UserId]` — a solo Bishop (`targetId == nil`) cannot scan. Rejects if already in `ScannedPlayers` (permanent, one scan per target ever). On success: `BishopCooldown = 2`, records the scan, fires `RoleRevealed:FireClient(player, targetPlayer.Name, WIN_CONDITIONS[targetData.Role])` to the Bishop only — no broadcast, no trace visible to anyone else.
+- **Client**: `BishopMenu` has only a `RevealButton`, no target list (the target is implicit) — see §6.3 for the visibility gate.
 
-```lua
-PendingActions.ActiveMurder = {
-    RequesterRole = "King" | "Usurper",
-    Target = "TargetPlayerName",
-    RequesterId = 123456789,
-}
-```
+## 11. Phase B — The Uprising (The Peasant)
 
-- **Usurper's fake order** (`handleFakeMurder()`, valid only during `DayGathering`, caller must be an alive `Usurper`): if `ActiveMurder` already holds a `"King"` order, the King has already spoken that cycle — the Usurper's attempt is rejected outright and `OrderVoided` fires back to them immediately. Otherwise, `ActiveMurder` is written with `RequesterRole = "Usurper"`.
-- **King's real order** (`handleOrderMurder()`, valid only during `SecretMeetings` — a later, separate phase from the Usurper's window): if `ActiveMurder` currently holds a `"Usurper"` order, `OrderVoided` fires to that Usurper (their earlier fake order is being overridden) *before* `ActiveMurder` is overwritten with `RequesterRole = "King"`. King precedence is therefore just a consequence of the King's phase coming after the Usurper's in the same day cycle, not an explicit priority check on the target.
-- **The executioner never knows which is which up front** — `ExecutionPrompt` only ever carries a target name, whether the order came from the King or the Usurper. The distinction only surfaces in `handleConfirmExecution()`, *after* the kill successfully lands: if `activeMurder.RequesterRole == "Usurper"`, the server fires `FakeOrderRevealed` to the executioner (client shows a temporary red *"THE KING DID NOT ORDER THAT!"* banner for 5 seconds) and sets `PlayerData[activeMurder.RequesterId].Cooldown = 3`.
-- **Cooldown math**: `tickCooldowns()` runs on every `NightPhase → DayGathering` transition — including the very next one right after the fake order was caught. A `Cooldown` of `3` therefore takes three ticks to reach `0`, which means the Usurper's menu (gated on `Cooldown == 0` in `updateVisibility()`) stays hidden through two full `DayGathering`s before becoming available again on the third.
-- **Client wiring**: `UsurperMenu` (`PlayerList` + `FakeOrderButton`) mirrors the `AssassinationMenu` pattern exactly — see §8 for `populateUsurperList()`. `OrderVoided.OnClientEvent` has two independent branches: the pre-existing one resets the Executioner UI when `activeMenu == "Executioner"`, and a second one — gated on `isPlayerAlive(localPlayer) and localPlayerRole == "Usurper"` — shows a temporary red *"THE KING HAS MADE THEIR DECREE. YOUR ORDER IS VOID."* banner for 6 seconds. Both this banner and the `FakeOrderRevealed` banner are built by a shared `showTemporaryBanner(name, text, duration)` helper.
+### 11.1 Gossip
 
-## 11. The Spy (Room Crasher)
-
-The Spy trades their own `SecretMeetings` room pairing for the ability to physically relocate into someone else's room, invisible, and read that room's private chat — at the cost of abandoning their own partner and being unable to speak while eavesdropping.
-
-**Room partner tracking (`GameState.SecretPairs` / `RoomPartnerSync`)**: every `SecretMeetings` phase, `runSecretMeetings()` in `GameLoop.server.luau` builds room pairs via `pairPlayersInRoom(playerA, playerB, room)`, which writes both directions of the pairing into the shared, bidirectional `GameState.SecretPairs` map (`SecretPairs[a] = b` and `SecretPairs[b] = a`) and fires `RoomPartnerSync:FireClient(...)` to each of the two players with the *other's* name (an unpaired solo player gets fired `""`). The client's `RoomPartnerSync.OnClientEvent` handler stores this as `currentRoomPartner`, coercing both `nil` and `""` to Lua `nil` (`(partnerName and partnerName ~= "") and partnerName or nil`) so downstream code can do simple truthiness checks. `SecretPairs` is `table.clear()`-ed on the `SecretMeetings → EveningGathering` transition (see §2), so it only ever reflects the *current* day's pairing.
-
-**Eavesdrop action (`handleEavesdrop()` in `ActionHandler.server.luau`)**: fired via `ActionRequest("Eavesdrop", targetName)` from the client's `EavesdropButton` (see §4/§8 for `SpyMenu`/`populateSpyList()`/`spyTargetList`). Validates, in order: `GameState.CurrentState == "SecretMeetings"`; caller's `PlayerData.Role == "Spy"`; caller `IsAlive == true`; the target exists and isn't the caller; both the Spy's and the target's characters have a resolvable `HumanoidRootPart`. Only then does it act:
-1. **Partner notification**: looks up the Spy's *own* current partner via `GameState.SecretPairs[player.UserId]` (i.e. before any state changes) and, if one exists, fires `PartnerDitched:FireClient(partnerPlayer)`. The client's `PartnerDitched.OnClientEvent` shows a 6-second red banner: *"YOUR PARTNER HAS ABANDONED YOU. YOU ARE ALONE."* This does not touch `SecretPairs` itself — the Spy's original partner is still nominally "paired" with the Spy in the data (it's a notification, not a repairing), it's only chat delivery (§7) and the Spy's own physical presence that actually change.
-2. **Physical infiltration — teleport**: `spyCharacter:PivotTo(targetRoot.CFrame * CFrame.new(0, 5, 0))` moves the Spy's entire character to a position 5 studs above the target's `HumanoidRootPart`, i.e. directly into the target's Secret Room, hovering above them.
-3. **Physical infiltration — invisibility & collision bypass**: `applySpyInvisibility(spyCharacter)` walks `spyCharacter:GetDescendants()` and, for every `BasePart`, sets `Transparency = 1` and `CollisionGroup = "Spies"`; for every `Decal`, `Transparency = 1`; for every `BillboardGui` (nametags etc.), `Enabled = false`. The `"Spies"` collision group is registered at `GameLoop.server.luau` script start alongside `"Alive"`/`"Ghosts"`, with `PhysicsService:CollisionGroupSetCollidable("Alive", "Spies", false)` — so a Spy mid-eavesdrop can stand inside/walk through the room's other occupants (and vice versa) without being physically blocked or shoved out, the same non-collision trick used for ghosts.
-4. **Physical infiltration — catching late-loading parts**: `hookSpyDescendantListener(player, spyCharacter)` connects `spyCharacter.DescendantAdded` and applies the exact same transparency/`CollisionGroup` treatment to any descendant added *after* the initial pass — necessary because accessories/limbs can stream in asynchronously after a teleport/respawn, and a late-loading hat or hair that skipped the initial `GetDescendants()` sweep would otherwise render visibly and collide normally, giving the Spy away. The connection is stored per-player in `GameState.SpyConnections[player.UserId]`, disconnecting (and replacing) any pre-existing connection for that player first, so re-eavesdropping mid-game never leaks a stale listener.
-5. **Server bookkeeping**: `GameState.SpyTarget = targetPlayer.UserId` — this is the flag `ChatFilter.server.luau` reads to grant the Spy read access to the infiltrated room's chat (see §7), and is also what the client's `updateVisibility()`/menu logic on the *Spy's own client* doesn't need to know about (the Spy client only cares about `currentRoomPartner` for its own target list).
-
-**Cleanup**: on the `SecretMeetings → EveningGathering` transition (`GameLoop.server.luau`, see §2), every living Spy has `removeSpyInvisibility(character, player)` called on them: it walks `GetDescendants()` again, restoring every `BasePart`'s `CollisionGroup` to `"Alive"` and `Transparency` to `0` — **except** `HumanoidRootPart`, which is explicitly forced to `Transparency = 1` (matching how every character's root part is invisible by default in Roblox, Spy or not), restores `Decal` transparency to `0` and re-`Enabled`s every `BillboardGui`, then disconnects and clears that player's `GameState.SpyConnections` entry so no stale `DescendantAdded` listener keeps re-applying invisibility on the next respawn.
-
-**Client target list (`populateSpyList()`)**: mirrors the generic target-list shape (see §8) but excludes whichever player's name matches `currentRoomPartner` — you can't "eavesdrop" on the room you're already in.
-
-## 12. The Martyr (Room Crasher)
-
-The Martyr can swear a one-time, irrevocable oath to protect their current room partner. Once sworn, they're permanently paired with that player every remaining day, and will die in that player's place if anyone tries to kill them.
-
-**The Permanent Blood Oath (`handleMartyrOath()` in `ActionHandler.server.luau`)**: fired via `ActionRequest("MartyrOath", targetName)` from the client's `OathButton` (see §4/§8 for `MartyrMenu`/`populateMartyrList()`/`martyrTargetList`, and the client-side rule that the menu only ever shows one candidate — the current room partner). Validates, in order: `GameState.CurrentState == "SecretMeetings"`; caller's `PlayerData.Role == "Martyr"`; caller `IsAlive == true`; caller's `ProtectedTargetUserId` is currently `nil` (an oath can only be sworn once — a second attempt is silently rejected, which is also what makes the client-side permanent-hide behavior in §4 safe to rely on); the target exists and isn't the caller; and — the server-side enforcement mirroring the client's UI restriction — `GameState.SecretPairs[player.UserId] == targetPlayer.UserId`, i.e. the target really is the Martyr's *current* room partner per the server's own pairing state, not just whatever the client happened to send. If all of that holds, `requesterData.ProtectedTargetUserId = targetPlayer.UserId` is set and never touched again for the rest of the game (nothing clears it — not `table.clear(GameState.SecretPairs)`, not the day/night loop; only a fresh `assignRoles()` at game restart resets `PlayerData` entirely). The next `AliveStatusUpdate` broadcast propagates this to every client via the `ProtectedTarget` field (see §8), which is how the oath-taker's own client learns to permanently hide the `MartyrMenu` (see §4).
-
-**Forced Matchmaking (`runSecretMeetings()` in `GameLoop.server.luau`)**: before the normal sequential pairing pass runs, `runSecretMeetings()` scans the (name-sorted) list of living players for one whose `PlayerData.Role == "Martyr"` and `ProtectedTargetUserId ~= nil`. If found, and the protected player (`Players:GetPlayerByUserId(data.ProtectedTargetUserId)`) is currently connected and alive, both the Martyr and their protected target are removed from the pool of players eligible for the normal pairing loop, and `pairPlayersInRoom(martyr, protectedPlayer, room)` forcibly seats them together in the next available room (`roomIndex`, starting at `Room1`) — with an extra debug note (`" (Martyr's forced oath pairing)"`) appended to the print log so this path is distinguishable from an organic pairing in server logs. This means that from the day the oath is sworn onward, the Martyr and their protected target are placed in the same Secret Room **every single day** for the rest of the game, regardless of how the rest of the player pool would have shuffled — the oath isn't just a protection flag, it's also a standing room assignment. The scan `break`s after handling the first oathbound Martyr it finds — with only one `Martyr` role in `ROLES`, this isn't a practical limitation today, but it means a hypothetical second Martyr wouldn't get the same forced-pairing treatment without further changes.
-
-**The Night Sacrifice (`findLivingMartyrProtecting()` / `redirectToMartyr()`, both in `ActionHandler.server.luau`)**: `findLivingMartyrProtecting(targetUserId)` is a shared lookup — scanning all connected players for a living `Martyr` whose `ProtectedTargetUserId == targetUserId` — called from **both** lethal-action handlers immediately before they'd otherwise apply fatal damage:
-- `handleConfirmExecution()` (King/Usurper-ordered kill, confirmed by a Sorcerer/Knight): checked right after confirming the target isn't the Prince and resolving a valid `Humanoid`, *before* setting `Health = 0`.
-- `handleAssassination()` (Revolutionary's instant night kill): checked right after resolving a valid `Humanoid`, *before* setting `Health = 0`.
-
-If a protecting Martyr is found, `redirectToMartyr(martyrPlayer, attackerPlayer, originalTargetPlayer)` runs instead of the normal kill: it sets the **Martyr's own** `Humanoid.Health = 0` and flips the **Martyr's own** `PlayerData.IsAlive = false` — the original target takes no damage and survives — then fires `StrikeIntercepted:FireClient(attackerPlayer, martyrPlayer.Name, originalTargetPlayer.Name)` to just the attacker (the executioner who confirmed the kill, or the Revolutionary), not a broadcast, so only the person responsible for the strike learns it was intercepted (and by whom). Both call sites then run their normal post-kill bookkeeping exactly as if the kill had landed on the original target: `handleConfirmExecution()` still fires `FakeOrderRevealed`/assigns the Usurper's `Cooldown = 3` if `activeMurder.RequesterRole == "Usurper"` (the King/Usurper distinction is about who gave the order, not who ended up dead), clears `PendingActions.ActiveMurder`, and calls `broadcastAliveStatus()`; `handleAssassination()` likewise calls `broadcastAliveStatus()` (its Rule-of-Chronology `OrderVoided` check, keyed on the *original* target's `UserId`, correctly does **not** fire here, since the player whose order might have been voided by dying is the Martyr, not the original target, and the Martyr was never a `RequesterId` for anything). A dead Martyr is not exempt from being someone else's kill target in a later round — `findLivingMartyrProtecting()` filters on `IsAlive == true`, so once a Martyr has sacrificed themselves, no future strike can be redirected to them.
-
-**Client notification (`StrikeIntercepted.OnClientEvent` in `ActionController.client.luau`)**: shows a 6-second red banner via the shared `showTemporaryBanner` helper: *"YOUR STRIKE ON `<ORIGINAL TARGET, UPPERCASE>` WAS INTERCEPTED BY `<MARTYR NAME, UPPERCASE>`!"* — only the attacking client sees this; there's no corresponding UI event for the original target (who is simply still alive) or for the wider room (the interception is invisible to everyone except the would-be killer).
-
-## 13. The Bishop
-
-The Bishop has a stealthy, cooldown-gated ability that reveals which of the four win conditions their *current room partner* is fighting for — without ever notifying the target they were scanned.
-
-**Data layer (`PlayerData.BishopCooldown` / `PlayerData.ScannedPlayers`)**: both fields are initialized by `assignRoles()` in `GameLoop.server.luau` — `BishopCooldown = 0` (scan immediately available) and `ScannedPlayers = {}` (a fresh, empty array-style table of previously-revealed `UserId`s) — for every player regardless of role, same as `ProtectedTargetUserId`. `BishopCooldown` is decremented once per day by a dedicated loop at the very start of the `DayGathering` branch in the main `while true do` loop (see §2): it iterates every alive player and, if their `Role == "Bishop"` and `BishopCooldown > 0`, subtracts `1`. This is a separate mechanism from `tickCooldowns()` (which only touches the generic `Cooldown` field used by the Usurper — see §10) and runs on a different cadence: `tickCooldowns()` fires once per `NightPhase → DayGathering` transition, while the Bishop's decrement fires every time the loop *enters* `DayGathering`, including the very first day. `ScannedPlayers` only ever grows via `table.insert()` in `handleBishopReveal()` and is never cleared for the rest of the game, so a given target can only ever be scanned once, permanently.
-
-**Win Condition Map (`WIN_CONDITIONS` in `ActionHandler.server.luau`)**: a local, static dictionary — not stored on `PlayerData`, computed fresh from `targetData.Role` on every reveal:
+A passive, involuntary tell fired inside `runSecretMeetings()` right after `pairPlayersInRoom()`:
 
 ```lua
-local WIN_CONDITIONS = {
-    King = "The Crown", Sorcerer = "The Crown", Prince = "The Crown", Knight = "The Crown", Double = "The Crown",
-    Revolutionary = "The Uprising", Peasant = "The Uprising", Spy = "The Uprising",
-    Usurper = "The Rogue",
-    Martyr = "The Oathbound",
-}
+if dataA.Role == "Peasant" and (dataB.Role == "Peasant" or dataB.Role == "Double") then
+    GossipPing:FireClient(playerA)
+end
+-- (mirrored for playerB)
 ```
 
-Notably, `Bishop` itself has no entry — scanning another Bishop would resolve `winCondition` to `nil` and reveal `"nil"` in the banner text; this hasn't come up in testing since the test rig only ever seats one Bishop.
+Both checks run independently — a Peasant+Peasant pair pings *both*; a Peasant+Double pair pings only the Peasant. No validation, no cooldown, nothing recorded — the only trace is the client's 5-second `BANNER_INFO_COLOR` banner: *"WHISPERS IN THE DARK: YOUR PARTNER MIGHT BE A PEASANT..."* — deliberately vague, doesn't distinguish the two trigger cases.
 
-**The Server Action (`handleBishopReveal(player)` in `ActionHandler.server.luau`)**: fired via `ActionRequest("BishopReveal")` from the client's `RevealButton` — deliberately called with **no** `targetName` argument, unlike every other action in the dispatcher (see §3's `ActionRequest` row for the resulting dispatcher-level change: the top-level guard was loosened from requiring `targetName` to be a string to allowing it to be `nil`, specifically to let this action through). Validates, in order: `GameState.CurrentState == "SecretMeetings"`; caller's `PlayerData.Role == "Bishop"`; caller `IsAlive == true`; caller's `BishopCooldown == 0`. It then:
-1. **Resolves the target implicitly**: `targetId = GameState.SecretPairs[player.UserId]` — there's no target *parameter* at all; the Bishop can only ever scan whoever they're currently room-paired with (see §11 for how `SecretPairs` is populated). If `targetId` is `nil` (the Bishop is solo that day), the function returns early — a solo Bishop cannot scan.
-2. **Rejects repeat scans**: `table.find(requesterData.ScannedPlayers, targetId)` — if the target has already been revealed at any point this game, the action is silently rejected (no cooldown is spent, no error is surfaced to the client beyond the menu simply not being offered — see the client-side gating below).
-3. **Applies the cooldown and records the scan**: `requesterData.BishopCooldown = 2` and `table.insert(requesterData.ScannedPlayers, targetId)` — both happen together, unconditionally, once every validation above has passed and *before* the reveal is resolved, so even if something downstream were to fail the cooldown/record has already been committed (there's no rollback path).
-4. **The stealth reveal**: resolves `targetPlayer`/`targetData` from `targetId`, looks up `WIN_CONDITIONS[targetData.Role]`, and fires `RoleRevealed:FireClient(player, targetPlayer.Name, winCondition)` — to the Bishop **only**. Nothing is fired to the target, no broadcast happens, and `broadcastAliveStatus()` is never called from this handler — the scan leaves no trace visible to anyone but the Bishop (aside from the delayed, incidental `BishopCooldown`/`ScannedPlayers` sync described in §8's gap).
+### 11.2 The Tribunal — accusation & majority
 
-**The Client UI (`ActionController.client.luau`)**: the `BishopMenu` contains only a `RevealButton` — no `PlayerList`, since there's nothing to choose (the target is implicit, same rationale as the Martyr's old partner-only restriction). `updateVisibility()` computes a local `bishopPartnerAlreadyScanned` boolean ahead of its branch chain: if `currentRoomPartner` is set, it resolves the corresponding `Player` via `Players:FindFirstChild(currentRoomPartner)` and checks `table.find(localScannedPlayers, partnerPlayer.UserId)`. The `"Bishop"` branch then requires **all** of: state contains `"secret"`, role is `"Bishop"`, `localBishopCooldown == 0`, `currentRoomPartner ~= nil`, and `not bishopPartnerAlreadyScanned` — mirroring the server's validation client-side so the menu only ever appears when a reveal would actually succeed. `revealButton.MouseButton1Click` fires `ActionRequest:FireServer("BishopReveal")` with no second argument, then closes the menu (`activeMenu = "None"`, `renderUI()`) without waiting for a response.
+`handlePeasantAccuse()` (`ActionRequest("Accuse", targetName)`), validates in order:
+1. `type(targetName) == "string"` (dispatcher-wide guard is loosened to allow `nil` for `BishopReveal`, so every target-taking handler added its own explicit check — this one, plus `handleEavesdrop()` and `handleMartyrOath()`).
+2. `GameState.CurrentState == "EveningGathering"`.
+3. `GameState.CurrentDay > 1` — Day 1 has no prior day to have voted about.
+4. Caller is an alive `Peasant`.
+5. **Absolute-day cooldown**: `GameState.CurrentDay <= GameState.LastTribunalDay + 1` → blocked (see §4.1's `LastTribunalDay` note for why this is a day-comparison, not a countdown).
+6. At least 3 living Peasants (`alivePeasants >= 3`) — below that, the mechanic is disabled entirely.
 
-**The banner (`RoleRevealed.OnClientEvent`)**: shows *"`<TARGET, UPPERCASE>` FIGHTS FOR: `<WIN CONDITION, UPPERCASE>`"* for 6 seconds. This is the first banner that isn't red: `showTemporaryBanner(name, text, duration, color: Color3?)` was extended with an optional fourth `color` parameter (defaulting to the existing `BANNER_TEXT_COLOR` red when omitted, so every pre-existing call site — `OrderVoided`, `FakeOrderRevealed`, `PartnerDitched`, `StrikeIntercepted` — is unaffected), and a new `BANNER_SUCCESS_COLOR = Color3.fromRGB(0, 200, 0)` (green) is passed explicitly for this one call, signaling that a Bishop reveal is a "win," not a warning, unlike every other banner in the game.
+Then: resolves the target, records `GameState.PeasantVotes[player.UserId] = targetPlayer.UserId` (overwrites any earlier vote from the same Peasant this window — it's a plain map, not an append-only list), computes `requiredVotes = math.floor(alivePeasants / 2) + 1`, tallies current votes for that target, and calls `Tribunal.Execute(targetPlayer)` (§12) if the threshold is met.
+
+### 11.3 The Tribunal — timeout tie-break
+
+Covered in full in §3.2's `EveningGathering` row. Summary: if the 20-second timer expires with `GameState.PeasantVotes` still non-empty (no early majority fired — an early majority already clears the table, so this naturally skips when one occurred), the server tallies every cast vote, finds the max vote count, collects every target tied at that count, picks one at random (`tiedTargets[math.random(1, #tiedTargets)]`), and calls `Tribunal.Execute()` on them exactly as an early majority would. A `tribunalFiredLate` flag gates an extra 6-second pause *before* the `PrivateQuarters` teleport (not after — the pause has to happen while players are still in the Grand Hall, or they'd already be in their Night Phase rooms by the time they could read the verdict). An early majority never gets this extra pause; it already has the rest of the 20-second window.
+
+### 11.4 `Tribunal.luau` — the shared execution module
+
+```lua
+function Tribunal.Execute(targetPlayer: Player)
+    GameState.LastTribunalDay = GameState.CurrentDay
+    table.clear(GameState.PeasantVotes)
+
+    local targetData = PlayerData[targetPlayer.UserId]
+    if targetData and targetData.Role == "King" then
+        TribunalResult:FireAllClients("THE MOB HAS EXPOSED " .. targetPlayer.Name:upper() .. " AS THE KING!", true)
+    else
+        TribunalResult:FireAllClients("THE MOB ACCUSED " .. targetPlayer.Name:upper() .. ", BUT THEY ARE NOT THE KING!", false)
+    end
+end
+```
+
+**Important**: this checks `targetData.Role == "King"` literally — **not** `HasCrown`. A Tribunal verdict on a crowned Double/Prince/Usurper (post-succession) will read as *"NOT THE KING"*, even though they now hold the real authority, because the Tribunal is testing the original starting-King identity, not the current crown-holder. This is a real behavioral quirk worth flagging, not something the current implementation reconciles.
+
+Exists as a shared module (not a `BindableEvent`) specifically so `handlePeasantAccuse()` (early majority) and `GameLoop.server.luau`'s timeout branch (tie-break) call the exact same logic without duplicating it — both already depend on `GameState.luau`, so a plain `require()` needed no new `default.project.json` entries.
+
+### 11.5 Client UI
+
+- `populatePeasantList()` (standard all-alive-except-self shape) / `AccuseButton` fires `ActionRequest("Accuse", targetName)`.
+- Visibility gate: see §6.3.
+- `hasCastPeasantVote`: reset to `false` inside `renderUI()` whenever `activeMenu == "Peasant"` (fresh window); set `true` by the `AccuseButton` handler right after firing, *before* `activeMenu` is set back to `"None"` — so the reset-on-open branch doesn't immediately erase the flag it was just asked to set.
+- `TribunalResult.OnClientEvent(message, isKing)`: forces `activeMenu = "None"` + `renderUI()` first (closes the menu for every Peasant, voted or not); then `if localPlayerRole == "Peasant" and isPlayerAlive(localPlayer) and not hasCastPeasantVote` shows the 3-second gray void banner *"THE MOB REACHED A MAJORITY WITHOUT YOU."* (role- and alive-gated, so the King/Bishop/other roles and dead Peasant ghosts don't see it); then the 6-second green/red verdict banner.
+
+## 12. Phase C — The Passive Inheritors
+
+### 12.1 `handleRoyalSuccession(deadUserId)`
+
+```lua
+if not deadData or deadData.HasCrown ~= true then return end
+
+-- Double, then Prince, then Usurper -- first living match wins
+```
+
+Three sequential scans over `Players:GetPlayers()`, each `break`-ing on the first living match: **Double** first, then **Prince**, then **Usurper** as the final fallback (added specifically for the case where King, Double, and Prince are all dead — the Usurper inherits the *real* crown). If none are found alive, the function returns and the crown is simply gone (no further fallback). On success: successor's `HasCrown = true`, dead player's `HasCrown = false`, `CrownInherited:FireClient(successorPlayer)` — private, no broadcast, nothing logged client-visibly. Called from both `handleConfirmExecution()` and `handleAssassination()`, immediately after the target's `IsAlive` flips to `false` — **not** from the Martyr's own death inside `redirectToMartyr()` (a Martyr can never hold `HasCrown` in the first place, since it only ever starts on the King and transfers to Double/Prince/Usurper).
+
+### 12.2 Prince's Sorcerer-immunity & Knight Lockout
+
+Covered in full in §8.2.
+
+### 12.3 The `HasCrown` UI hand-off
+
+Because `updateVisibility()`'s King branch checks `localHasCrown` (§6.3) rather than a role string, and both `handleOrderMurder()`/`handleFakeMurder()` check `HasCrown` server-side (§8.1), the entire "who can act as King" question is decided by one boolean, checked identically everywhere — no role-name special-casing needed anywhere in the authorization path. This is also what suppresses the Usurper's own menu the moment they inherit (§6.3's Usurper branch: `and not localHasCrown`), and what closes off their fake-order ability server-side too (`handleFakeMurder()`'s `if requesterData.HasCrown == true then return end`) — a crowned Usurper loses fake orders entirely, not just the UI for them.
+
+### 12.4 The `CrownInherited` banner — a known timing gap
+
+`CrownInherited.OnClientEvent` shows the 6-second gold banner *"THE KING IS DEAD. LONG LIVE THE KING. YOU NOW HOLD THE CROWN."* and calls `renderUI()`. Because succession only ever fires from a kill — which only ever happens during `NightPhase` — and the King's Murder menu is only ever offered during `SecretMeetings`, this `renderUI()` call **cannot** make the menu "instantly" appear at the moment of inheritance; it repaints whatever `activeMenu` already is (still `"None"`). The new crown-holder correctly gets the King menu on the *next* `SecretMeetings` phase's own `updateVisibility()` call, once `localHasCrown` has synced via the following `AliveStatusUpdate` — this is guaranteed by §6.3's King branch, independent of this `renderUI()` call. This was a deliberate implementation decision (confirmed against the alternative of trying to force the menu open outside its normal phase gate, which would have broken the established phase-gating pattern every other menu relies on) rather than an oversight.
+
+## 13. Known Quirks & Implementation Notes
+
+A consolidated list of real, verified-against-code behaviors worth knowing before touching this system further:
+
+1. **Double player-count gate** (§3.2): `WaitingForPlayers`'s outer wait (`>= 3`) is superseded by a stricter inner gate (`< 4`) in the action block. Keep both in sync if the lobby size changes again.
+2. **`notifyExecutioners()` doesn't check the recipient's `IsAlive`** — a dead Sorcerer/Knight still receives `ExecutionPrompt`; `handleConfirmExecution()`'s own alive check is what makes their confirm a no-op.
+3. **`PlayerData.Cooldown` (Usurper) is never initialized** in `assignRoles()`'s table literal — it's implicitly `nil` until `handleConfirmExecution()` first sets it to `3`. Both `tickCooldowns()` and `broadcastAliveStatus()` handle this gracefully (truthy check / `or 0`).
+4. **`StrikeIntercepted` is dual-purpose** (§5.3) — Martyr redirect and Prince immunity share the remote and banner template via placeholder substitution.
+5. **`Tribunal.luau` checks `Role == "King"`, not `HasCrown`** (§11.4) — a Tribunal verdict on a post-succession crown-holder will incorrectly read "not the King."
+6. **The two `broadcastAliveStatus()` copies have drifted before** (§5.2) — nothing structurally enforces they stay identical; verify both when adding a new snapshot field.
+7. **`TEST_RIG_ROLES`** (top of `GameLoop.server.luau`) is a mutable testing knob, currently `{ "King", "Revolutionary", "Prince", "Usurper" }` — expected to keep changing between test sessions; the *real* role distribution is whatever's left in `ROLES` after the test-rig slots, shuffled.
+8. **The Martyr's oath target is no longer restricted to the current room partner** — an earlier version enforced `GameState.SecretPairs[player.UserId] == targetPlayer.UserId` server-side; that check was removed, and the Martyr now teleports to *whichever* alive player they target, severing their old pairing in the process (§11.2).

@@ -45,6 +45,15 @@
       },
       "RoleRevealed": {
         "$className": "RemoteEvent"
+      },
+      "GossipPing": {
+        "$className": "RemoteEvent"
+      },
+      "TribunalResult": {
+        "$className": "RemoteEvent"
+      },
+      "CrownInherited": {
+        "$className": "RemoteEvent"
       }
     },
 

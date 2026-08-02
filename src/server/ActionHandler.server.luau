@@ -9,11 +9,14 @@ local FakeOrderRevealed = ReplicatedStorage:WaitForChild("FakeOrderRevealed")
 local PartnerDitched = ReplicatedStorage:WaitForChild("PartnerDitched")
 local StrikeIntercepted = ReplicatedStorage:WaitForChild("StrikeIntercepted")
 local RoleRevealed = ReplicatedStorage:WaitForChild("RoleRevealed")
+local CrownInherited = ReplicatedStorage:WaitForChild("CrownInherited")
 
 local SharedState = require(ReplicatedStorage.Shared.GameState)
 local GameState = SharedState.GameState
 local PlayerData = SharedState.PlayerData
 local PendingActions = GameState.PendingActions
+
+local Tribunal = require(ReplicatedStorage.Shared.Tribunal)
 
 local WIN_CONDITIONS = {
 	King = "The Crown",
@@ -34,6 +37,18 @@ GetMyRole.OnServerInvoke = function(player: Player)
 end
 
 local function broadcastAliveStatus()
+	local alivePeasantCount = 0
+	local isSorcererAlive = false
+	for _, player in Players:GetPlayers() do
+		local data = PlayerData[player.UserId]
+		if data and data.Role == "Peasant" and data.IsAlive == true then
+			alivePeasantCount += 1
+		end
+		if data and data.Role == "Sorcerer" and data.IsAlive == true then
+			isSorcererAlive = true
+		end
+	end
+
 	local snapshot = {}
 	for _, player in Players:GetPlayers() do
 		local data = PlayerData[player.UserId]
@@ -45,6 +60,11 @@ local function broadcastAliveStatus()
 			ProtectedTarget = data and data.ProtectedTargetUserId,
 			BishopCooldown = data and data.BishopCooldown,
 			ScannedPlayers = data and data.ScannedPlayers,
+			LastTribunalDay = GameState.LastTribunalDay,
+			AlivePeasantCount = alivePeasantCount,
+			CurrentDay = GameState.CurrentDay,
+			HasCrown = data and data.HasCrown,
+			IsSorcererAlive = isSorcererAlive,
 		})
 	end
 	AliveStatusUpdate:FireAllClients(snapshot)
@@ -86,13 +106,62 @@ local function redirectToMartyr(martyrPlayer: Player, attackerPlayer: Player, or
 	return true
 end
 
+local function handleRoyalSuccession(deadUserId: number)
+	local deadData = PlayerData[deadUserId]
+	if not deadData or deadData.HasCrown ~= true then
+		return
+	end
+
+	local successorPlayer: Player? = nil
+
+	for _, candidate in Players:GetPlayers() do
+		local candidateData = PlayerData[candidate.UserId]
+		if candidateData and candidateData.IsAlive == true and candidateData.Role == "Double" then
+			successorPlayer = candidate
+			break
+		end
+	end
+
+	if not successorPlayer then
+		for _, candidate in Players:GetPlayers() do
+			local candidateData = PlayerData[candidate.UserId]
+			if candidateData and candidateData.IsAlive == true and candidateData.Role == "Prince" then
+				successorPlayer = candidate
+				break
+			end
+		end
+	end
+
+	if not successorPlayer then
+		for _, candidate in Players:GetPlayers() do
+			local candidateData = PlayerData[candidate.UserId]
+			if candidateData and candidateData.IsAlive == true and candidateData.Role == "Usurper" then
+				successorPlayer = candidate
+				break
+			end
+		end
+	end
+
+	if not successorPlayer then
+		return
+	end
+
+	local successorData = PlayerData[successorPlayer.UserId]
+	successorData.HasCrown = true
+	deadData.HasCrown = false
+
+	CrownInherited:FireClient(successorPlayer)
+
+	print(successorPlayer.Name .. " (" .. successorData.Role .. ") has secretly inherited the Crown")
+end
+
 local function handleOrderMurder(player: Player, targetName: string)
 	if GameState.CurrentState ~= "SecretMeetings" then
 		return
 	end
 
 	local requesterData = PlayerData[player.UserId]
-	if not requesterData or requesterData.Role ~= "King" then
+	if not requesterData or requesterData.HasCrown ~= true then
 		return
 	end
 
@@ -132,6 +201,10 @@ local function handleFakeMurder(player: Player, targetName: string)
 		return
 	end
 
+	if requesterData.HasCrown == true then
+		return
+	end
+
 	local targetPlayer = Players:FindFirstChild(targetName)
 	if not targetPlayer or targetPlayer == player then
 		return
@@ -153,6 +226,10 @@ local function handleFakeMurder(player: Player, targetName: string)
 end
 
 local function handleMartyrOath(player: Player, targetName: string)
+	if type(targetName) ~= "string" then
+		return
+	end
+
 	if GameState.CurrentState ~= "SecretMeetings" then
 		return
 	end
@@ -252,6 +329,67 @@ local function handleBishopReveal(player: Player)
 	print(player.Name .. " (Bishop) secretly scanned " .. targetPlayer.Name .. " -- " .. tostring(winCondition))
 end
 
+local function handlePeasantAccuse(player: Player, targetName: string)
+	if type(targetName) ~= "string" then
+		return
+	end
+
+	if GameState.CurrentState ~= "EveningGathering" then
+		return
+	end
+
+	if GameState.CurrentDay <= 1 then
+		return
+	end
+
+	local requesterData = PlayerData[player.UserId]
+	if not requesterData or requesterData.Role ~= "Peasant" then
+		return
+	end
+
+	if requesterData.IsAlive ~= true then
+		return
+	end
+
+	if GameState.CurrentDay <= GameState.LastTribunalDay + 1 then
+		return
+	end
+
+	local alivePeasants = 0
+	for _, candidate in Players:GetPlayers() do
+		local candidateData = PlayerData[candidate.UserId]
+		if candidateData and candidateData.Role == "Peasant" and candidateData.IsAlive == true then
+			alivePeasants += 1
+		end
+	end
+
+	if alivePeasants < 3 then
+		return
+	end
+
+	local targetPlayer = Players:FindFirstChild(targetName)
+	if not targetPlayer or targetPlayer == player then
+		return
+	end
+
+	GameState.PeasantVotes[player.UserId] = targetPlayer.UserId
+
+	local requiredVotes = math.floor(alivePeasants / 2) + 1
+
+	local voteCount = 0
+	for _, votedUserId in GameState.PeasantVotes do
+		if votedUserId == targetPlayer.UserId then
+			voteCount += 1
+		end
+	end
+
+	print(player.Name .. " (Peasant) accused " .. targetPlayer.Name .. " -- votes: " .. voteCount .. "/" .. requiredVotes)
+
+	if voteCount >= requiredVotes then
+		Tribunal.Execute(targetPlayer)
+	end
+end
+
 local function handleConfirmExecution(player: Player, targetName: string)
 	if GameState.CurrentState ~= "NightPhase" then
 		return
@@ -260,6 +398,15 @@ local function handleConfirmExecution(player: Player, targetName: string)
 	local requesterData = PlayerData[player.UserId]
 	if not requesterData or (requesterData.Role ~= "Sorcerer" and requesterData.Role ~= "Knight") then
 		return
+	end
+
+	if requesterData.Role == "Knight" then
+		for _, candidate in Players:GetPlayers() do
+			local candidateData = PlayerData[candidate.UserId]
+			if candidateData and candidateData.Role == "Sorcerer" and candidateData.IsAlive == true then
+				return
+			end
+		end
 	end
 
 	if requesterData.IsAlive == false then
@@ -277,10 +424,6 @@ local function handleConfirmExecution(player: Player, targetName: string)
 	end
 
 	local targetData = PlayerData[targetPlayer.UserId]
-	if targetData and targetData.Role == "Prince" then
-		print(player.Name .. " failed to execute " .. targetPlayer.Name .. " -- the target is the Prince")
-		return
-	end
 
 	local character = targetPlayer.Character
 	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
@@ -307,11 +450,19 @@ local function handleConfirmExecution(player: Player, targetName: string)
 		return
 	end
 
+	if requesterData.Role == "Sorcerer" and targetData and targetData.Role == "Prince" then
+		StrikeIntercepted:FireClient(player, "THE PRINCE'S IMMUNITY", targetPlayer.Name)
+		print(player.Name .. " (Sorcerer) struck at " .. targetPlayer.Name .. ", but the Prince's immunity intercepted it")
+		return
+	end
+
 	humanoid.Health = 0
 
 	if targetData then
 		targetData.IsAlive = false
 	end
+
+	handleRoyalSuccession(targetPlayer.UserId)
 
 	if activeMurder.RequesterRole == "Usurper" then
 		FakeOrderRevealed:FireClient(player)
@@ -363,6 +514,10 @@ local function hookSpyDescendantListener(player: Player, character: Model)
 end
 
 local function handleEavesdrop(player: Player, targetName: string)
+	if type(targetName) ~= "string" then
+		return
+	end
+
 	if GameState.CurrentState ~= "SecretMeetings" then
 		return
 	end
@@ -446,6 +601,8 @@ local function handleAssassination(player: Player, targetName: string)
 		targetData.IsAlive = false
 	end
 
+	handleRoyalSuccession(targetPlayer.UserId)
+
 	-- Rule of Chronology: if the player we just killed had an order queued (e.g. a King's
 	-- OrderMurder), that order dies with them and must not be actioned later tonight.
 	local activeMurder = PendingActions.ActiveMurder
@@ -488,5 +645,7 @@ ActionRequest.OnServerEvent:Connect(function(player: Player, actionType: string,
 		handleEavesdrop(player, targetName)
 	elseif actionType == "BishopReveal" then
 		handleBishopReveal(player)
+	elseif actionType == "Accuse" then
+		handlePeasantAccuse(player, targetName)
 	end
 end)

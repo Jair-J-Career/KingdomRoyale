@@ -5,6 +5,8 @@ local GameState = {
 	SecretPairs = {},
 	SpyConnections = {},
 	SpyTarget = nil,
+	PeasantVotes = {},
+	LastTribunalDay = 0,
 }
 
 local PlayerData = {}

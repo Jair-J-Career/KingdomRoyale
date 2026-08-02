@@ -14,6 +14,9 @@ local PartnerDitched = ReplicatedStorage:WaitForChild("PartnerDitched")
 local RoomPartnerSync = ReplicatedStorage:WaitForChild("RoomPartnerSync")
 local StrikeIntercepted = ReplicatedStorage:WaitForChild("StrikeIntercepted")
 local RoleRevealed = ReplicatedStorage:WaitForChild("RoleRevealed")
+local GossipPing = ReplicatedStorage:WaitForChild("GossipPing")
+local TribunalResult = ReplicatedStorage:WaitForChild("TribunalResult")
+local CrownInherited = ReplicatedStorage:WaitForChild("CrownInherited")
 
 local localPlayer = Players.LocalPlayer
 local playerGui = localPlayer:WaitForChild("PlayerGui")
@@ -46,6 +49,10 @@ local oathButton = martyrMenu:WaitForChild("OathButton")
 local bishopMenu = actionUI:WaitForChild("BishopMenu")
 local revealButton = bishopMenu:WaitForChild("RevealButton")
 
+local peasantMenu = actionUI:WaitForChild("PeasantMenu")
+local peasantTargetList = peasantMenu:WaitForChild("PlayerList")
+local accuseButton = peasantMenu:WaitForChild("AccuseButton")
+
 local DEFAULT_COLOR = Color3.fromRGB(50, 50, 50)
 local SELECTED_COLOR = Color3.fromRGB(0, 170, 0)
 local TEXT_COLOR = Color3.fromRGB(255, 255, 255)
@@ -59,12 +66,19 @@ local selectedAssassinationTarget: string? = nil
 local selectedUsurperTarget: string? = nil
 local selectedSpyTarget: string? = nil
 local selectedMartyrTarget: string? = nil
+local selectedPeasantTarget: string? = nil
 local currentRoomPartner: string? = nil
 local localPlayerRole: string? = GetMyRole:InvokeServer()
 local pendingExecutionTarget: string? = nil
 local localProtectedTarget: number? = nil
 local localBishopCooldown: number = 0
 local localScannedPlayers: { number } = {}
+local localLastTribunalDay: number = 0
+local localAlivePeasantCount: number = 0
+local localCurrentDay: number = 1
+local hasCastPeasantVote = false
+local localHasCrown = false
+local localIsSorcererAlive = false
 
 local activeMenu = "None"
 local aliveStatus: { [number]: boolean } = {}
@@ -79,6 +93,10 @@ local function isPlayerAlive(player: Player): boolean
 end
 
 local function renderUI()
+	if activeMenu == "Peasant" then
+		hasCastPeasantVote = false
+	end
+
 	kingMurderAbility.Visible = (activeMenu == "KingMurder")
 	executionerMenu.Visible = (activeMenu == "Executioner")
 	assassinationMenu.Visible = (activeMenu == "Assassination")
@@ -86,6 +104,7 @@ local function renderUI()
 	spyMenu.Visible = (activeMenu == "Spy")
 	martyrMenu.Visible = (activeMenu == "Martyr")
 	bishopMenu.Visible = (activeMenu == "Bishop")
+	peasantMenu.Visible = (activeMenu == "Peasant")
 end
 
 local function setCharacterTransparency(character: Model, transparency: number)
@@ -137,6 +156,11 @@ AliveStatusUpdate.OnClientEvent:Connect(
 			ProtectedTarget: number?,
 			BishopCooldown: number?,
 			ScannedPlayers: { number }?,
+			LastTribunalDay: number?,
+			AlivePeasantCount: number?,
+			CurrentDay: number?,
+			HasCrown: boolean?,
+			IsSorcererAlive: boolean?,
 		}
 	})
 		local wasLocalPlayerAlive = isPlayerAlive(localPlayer)
@@ -150,6 +174,11 @@ AliveStatusUpdate.OnClientEvent:Connect(
 				localProtectedTarget = entry.ProtectedTarget
 				localBishopCooldown = entry.BishopCooldown or 0
 				localScannedPlayers = entry.ScannedPlayers or {}
+				localLastTribunalDay = entry.LastTribunalDay or 0
+				localAlivePeasantCount = entry.AlivePeasantCount or 0
+				localCurrentDay = entry.CurrentDay or localCurrentDay
+				localHasCrown = entry.HasCrown == true
+				localIsSorcererAlive = entry.IsSorcererAlive == true
 			end
 		end
 		aliveStatus = newStatus
@@ -167,6 +196,9 @@ AliveStatusUpdate.OnClientEvent:Connect(
 
 local BANNER_TEXT_COLOR = Color3.fromRGB(255, 0, 0)
 local BANNER_SUCCESS_COLOR = Color3.fromRGB(0, 200, 0)
+local BANNER_INFO_COLOR = Color3.fromRGB(130, 150, 190)
+local BANNER_GRAY_COLOR = Color3.fromRGB(160, 160, 160)
+local BANNER_GOLD_COLOR = Color3.fromRGB(212, 175, 55)
 
 local function showTemporaryBanner(name: string, text: string, duration: number, color: Color3?)
 	local existing = actionUI:FindFirstChild(name)
@@ -497,6 +529,54 @@ local function populateMartyrList()
 	end
 end
 
+local function resetPeasantButtonColors()
+	for _, child in peasantTargetList:GetChildren() do
+		if child:IsA("TextButton") then
+			child.BackgroundColor3 = DEFAULT_COLOR
+		end
+	end
+end
+
+local function selectPeasantTarget(targetName: string, clickedButton: TextButton)
+	selectedPeasantTarget = targetName
+	resetPeasantButtonColors()
+	clickedButton.BackgroundColor3 = SELECTED_COLOR
+end
+
+local function populatePeasantList()
+	clearNoTargetsLabel(peasantTargetList)
+	for _, child in peasantTargetList:GetChildren() do
+		if child:IsA("TextButton") then
+			child:Destroy()
+		end
+	end
+
+	local targetCount = 0
+	for _, player in Players:GetPlayers() do
+		if player ~= Players.LocalPlayer and isPlayerAlive(player) then
+			targetCount += 1
+
+			local button = Instance.new("TextButton")
+			button.Name = player.Name
+			button.Text = player.Name
+			button.Size = UDim2.new(1, 0, 0, 50)
+			button.TextScaled = true
+			button.BackgroundColor3 = DEFAULT_COLOR
+			button.TextColor3 = TEXT_COLOR
+			button.Parent = peasantTargetList
+
+			button.MouseButton1Click:Connect(function()
+				selectPeasantTarget(player.Name, button)
+			end)
+		end
+	end
+
+	setActionButtonEnabled(accuseButton, targetCount > 0)
+	if targetCount == 0 then
+		showNoTargetsLabel(peasantTargetList)
+	end
+end
+
 local function updateVisibility()
 	print("VISIBILITY CHECK -> Role: ", tostring(localPlayerRole), " | State: ", tostring(CurrentGameState.Value))
 
@@ -511,7 +591,7 @@ local function updateVisibility()
 		end
 	end
 
-	if string.find(stateLower, "secret") and localPlayerRole == "King" then
+	if string.find(stateLower, "secret") and localHasCrown == true then
 		activeMenu = "KingMurder"
 		populatePlayerList()
 	elseif string.find(stateLower, "secret") and localPlayerRole == "Spy" then
@@ -528,12 +608,25 @@ local function updateVisibility()
 		and not bishopPartnerAlreadyScanned
 	then
 		activeMenu = "Bishop"
+	elseif
+		string.find(stateLower, "evening")
+		and localPlayerRole == "Peasant"
+		and localCurrentDay > 1
+		and localCurrentDay > (localLastTribunalDay + 1)
+		and localAlivePeasantCount >= 3
+	then
+		activeMenu = "Peasant"
+		populatePeasantList()
 	elseif string.find(stateLower, "night") and localPlayerRole == "Revolutionary" then
 		activeMenu = "Assassination"
 		populateAssassinationList()
-	elseif string.find(stateLower, "night") and activeMenu == "Executioner" then
+	elseif
+		string.find(stateLower, "night")
+		and activeMenu == "Executioner"
+		and (localPlayerRole == "Sorcerer" or (localPlayerRole == "Knight" and localIsSorcererAlive == false))
+	then
 		-- Do nothing, preserve the menu
-	elseif string.find(stateLower, "day gathering") and localPlayerRole == "Usurper" and localCooldown == 0 then
+	elseif string.find(stateLower, "day gathering") and localPlayerRole == "Usurper" and localCooldown == 0 and not localHasCrown then
 		activeMenu = "Usurper"
 		populateUsurperList()
 	else
@@ -625,6 +718,19 @@ oathButton.MouseButton1Click:Connect(function()
 	renderUI()
 end)
 
+accuseButton.MouseButton1Click:Connect(function()
+	if not selectedPeasantTarget then
+		return
+	end
+
+	ActionRequest:FireServer("Accuse", selectedPeasantTarget)
+	hasCastPeasantVote = true
+	selectedPeasantTarget = nil
+	resetPeasantButtonColors()
+	activeMenu = "None"
+	renderUI()
+end)
+
 StrikeIntercepted.OnClientEvent:Connect(function(martyrName: string, originalTargetName: string)
 	showTemporaryBanner(
 		"StrikeInterceptedBanner",
@@ -646,6 +752,42 @@ RoleRevealed.OnClientEvent:Connect(function(targetName: string, winCondition: st
 		6,
 		BANNER_SUCCESS_COLOR
 	)
+end)
+
+GossipPing.OnClientEvent:Connect(function()
+	showTemporaryBanner(
+		"GossipPingBanner",
+		"WHISPERS IN THE DARK: YOUR PARTNER MIGHT BE A PEASANT...",
+		5,
+		BANNER_INFO_COLOR
+	)
+end)
+
+TribunalResult.OnClientEvent:Connect(function(message: string, isKing: boolean)
+	activeMenu = "None"
+	renderUI()
+
+	if isPlayerAlive(localPlayer) and localPlayerRole == "Peasant" and not hasCastPeasantVote then
+		showTemporaryBanner("TribunalVoidBanner", "THE MOB REACHED A MAJORITY WITHOUT YOU.", 3, BANNER_GRAY_COLOR)
+	end
+
+	showTemporaryBanner(
+		"TribunalResultBanner",
+		message,
+		6,
+		isKing and BANNER_SUCCESS_COLOR or BANNER_TEXT_COLOR
+	)
+end)
+
+CrownInherited.OnClientEvent:Connect(function()
+	showTemporaryBanner(
+		"CrownInheritedBanner",
+		"THE KING IS DEAD. LONG LIVE THE KING. YOU NOW HOLD THE CROWN.",
+		6,
+		BANNER_GOLD_COLOR
+	)
+
+	renderUI()
 end)
 
 updateVisibility()

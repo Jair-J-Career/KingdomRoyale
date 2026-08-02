@@ -8,11 +8,14 @@ local RoleAssigned = ReplicatedStorage:WaitForChild("RoleAssigned")
 local ExecutionPrompt = ReplicatedStorage:WaitForChild("ExecutionPrompt")
 local AliveStatusUpdate = ReplicatedStorage:WaitForChild("AliveStatusUpdate")
 local RoomPartnerSync = ReplicatedStorage:WaitForChild("RoomPartnerSync")
+local GossipPing = ReplicatedStorage:WaitForChild("GossipPing")
 
 local SharedState = require(ReplicatedStorage.Shared.GameState)
 local GameState = SharedState.GameState
 local PlayerData = SharedState.PlayerData
 local PendingActions = GameState.PendingActions
+
+local Tribunal = require(ReplicatedStorage.Shared.Tribunal)
 
 local ALIVE_COLLISION_GROUP = "Alive"
 local GHOST_COLLISION_GROUP = "Ghosts"
@@ -69,11 +72,25 @@ local function shuffle(array)
 	end
 end
 
--- Test rig: the first three players (sorted by name) are forced into fixed roles
--- so the Bishop's cooldown-based scan ability can be tested against a King.
-local TEST_RIG_ROLES = { "Bishop", "Peasant", "King" }
+-- Test rig: King/Revolutionary/Prince/Usurper. No Sorcerer or Knight this round, so neither
+-- the King's real order nor the Usurper's fake order can ever be confirmed -- only the
+-- Usurper/King precedence (OrderVoided) fires, plus the Revolutionary's instant night kill;
+-- Crown succession has no Double this round, so it falls straight to the Prince.
+local TEST_RIG_ROLES = { "King", "Revolutionary", "Prince", "Usurper" }
 
 local function broadcastAliveStatus()
+	local alivePeasantCount = 0
+	local isSorcererAlive = false
+	for _, player in Players:GetPlayers() do
+		local data = PlayerData[player.UserId]
+		if data and data.Role == "Peasant" and data.IsAlive == true then
+			alivePeasantCount += 1
+		end
+		if data and data.Role == "Sorcerer" and data.IsAlive == true then
+			isSorcererAlive = true
+		end
+	end
+
 	local snapshot = {}
 	for _, player in Players:GetPlayers() do
 		local data = PlayerData[player.UserId]
@@ -85,6 +102,11 @@ local function broadcastAliveStatus()
 			ProtectedTarget = data and data.ProtectedTargetUserId,
 			BishopCooldown = data and data.BishopCooldown,
 			ScannedPlayers = data and data.ScannedPlayers,
+			LastTribunalDay = GameState.LastTribunalDay,
+			AlivePeasantCount = alivePeasantCount,
+			CurrentDay = GameState.CurrentDay,
+			HasCrown = data and data.HasCrown,
+			IsSorcererAlive = isSorcererAlive,
 		})
 	end
 	AliveStatusUpdate:FireAllClients(snapshot)
@@ -115,6 +137,7 @@ local function assignRoles()
 				ProtectedTargetUserId = nil,
 				BishopCooldown = 0,
 				ScannedPlayers = {},
+				HasCrown = (role == "King"),
 			}
 			print(player.Name .. " has been assigned the role of " .. role)
 			RoleAssigned:FireClient(player, role)
@@ -134,6 +157,7 @@ local function assignRoles()
 			ProtectedTargetUserId = nil,
 			BishopCooldown = 0,
 			ScannedPlayers = {},
+			HasCrown = (role == "King"),
 		}
 		print(player.Name .. " has been assigned the role of " .. role)
 		RoleAssigned:FireClient(player, role)
@@ -251,9 +275,22 @@ local function notifyExecutioners()
 
 	local targetName = activeMurder.Target
 
+	local isSorcAlive = false
+	for _, player in Players:GetPlayers() do
+		local data = PlayerData[player.UserId]
+		if data and data.Role == "Sorcerer" and data.IsAlive == true then
+			isSorcAlive = true
+			break
+		end
+	end
+
 	for _, player in Players:GetPlayers() do
 		local data = PlayerData[player.UserId]
 		if data and (data.Role == "Sorcerer" or data.Role == "Knight") then
+			if data.Role == "Knight" and isSorcAlive == true then
+				continue
+			end
+
 			print("Sending ExecutionPrompt to: ", player.Name, " for target: ", targetName)
 			ExecutionPrompt:FireClient(player, targetName)
 		end
@@ -298,6 +335,20 @@ local function runSecretMeetings()
 			local room = Workspace.SecretRooms:FindFirstChild("Room" .. roomIndex)
 			print("[MATCHMAKING] Pairing " .. playerA.Name .. " and " .. playerB.Name .. " in Room " .. roomIndex)
 			pairPlayersInRoom(playerA, playerB, room)
+
+			-- Gossip: a Peasant paired with another Peasant or a Double senses something is
+			-- off about their room partner and gets a silent ping, revealing nothing further.
+			local dataA = PlayerData[playerA.UserId]
+			local dataB = PlayerData[playerB.UserId]
+
+			if dataA and dataA.Role == "Peasant" and dataB and (dataB.Role == "Peasant" or dataB.Role == "Double") then
+				GossipPing:FireClient(playerA)
+			end
+
+			if dataB and dataB.Role == "Peasant" and dataA and (dataA.Role == "Peasant" or dataA.Role == "Double") then
+				GossipPing:FireClient(playerB)
+			end
+
 			roomIndex += 1
 		else
 			local soloRoom = Workspace.SecretRooms.Room8
@@ -342,6 +393,13 @@ while true do
 		until #Players:GetPlayers() >= 3
 	elseif GameState.CurrentState == "SecretMeetings" then
 		task.wait(20)
+	elseif GameState.CurrentState == "EveningGathering" then
+		-- Peasants need time to cast their Tribunal votes, but Day 1 has no votes to cast yet.
+		if GameState.CurrentDay > 1 then
+			task.wait(20)
+		else
+			task.wait(5)
+		end
 	else
 		task.wait(5)
 	end
@@ -349,10 +407,18 @@ while true do
 	print(GameState.CurrentState, GameState.CurrentDay)
 
 	if GameState.CurrentState == "WaitingForPlayers" then
-		-- Force the server to wait for all 3 test clients to connect
-		while #Players:GetPlayers() < 3 do
+		-- Force the server to wait for all 4 test clients to connect
+		while #Players:GetPlayers() < 4 do
 			task.wait(1)
 		end
+
+		-- Ensure all test clients have fully spawned their physical characters
+		for _, player in ipairs(Players:GetPlayers()) do
+			if not player.Character then
+				player.CharacterAdded:Wait()
+			end
+		end
+		task.wait(2) -- Let physics settle before teleporting
 
 		assignRoles()
 		GameState.CurrentState = "DayGathering"
@@ -387,6 +453,48 @@ while true do
 		teleportPlayersTo(Workspace.GrandHall.SpawnPoint_Main)
 	elseif GameState.CurrentState == "EveningGathering" then
 		GameState.CurrentState = "NightPhase"
+
+		local tribunalFiredLate = false
+
+		-- Timeout tie-break: if the Evening Gathering timer ran out without an early
+		-- majority, tally whatever votes were cast and force a verdict on the most-voted
+		-- target(s), picking randomly among ties, exactly as if a majority had been reached.
+		if next(GameState.PeasantVotes) ~= nil then
+			local voteCounts = {}
+			for _, votedUserId in GameState.PeasantVotes do
+				voteCounts[votedUserId] = (voteCounts[votedUserId] or 0) + 1
+			end
+
+			local maxVotes = 0
+			for _, count in voteCounts do
+				if count > maxVotes then
+					maxVotes = count
+				end
+			end
+
+			local tiedTargets = {}
+			for votedUserId, count in voteCounts do
+				if count == maxVotes then
+					table.insert(tiedTargets, votedUserId)
+				end
+			end
+
+			local chosenTarget = Players:GetPlayerByUserId(tiedTargets[math.random(1, #tiedTargets)])
+			if chosenTarget then
+				print("[TRIBUNAL] Evening Gathering timed out with no majority -- forcing a verdict on " .. chosenTarget.Name)
+				Tribunal.Execute(chosenTarget)
+				tribunalFiredLate = true
+			end
+		end
+
+		table.clear(GameState.PeasantVotes)
+
+		-- Give players a moment to read the tie-breaker banner in the Grand Hall before
+		-- they get teleported away into Night Phase.
+		if tribunalFiredLate then
+			task.wait(6)
+		end
+
 		teleportPlayersTo(Workspace.PrivateQuarters.SpawnPoint_Private)
 		notifyExecutioners()
 	elseif GameState.CurrentState == "NightPhase" then

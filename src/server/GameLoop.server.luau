@@ -2,6 +2,7 @@ local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local PhysicsService = game:GetService("PhysicsService")
+local TeleportService = game:GetService("TeleportService")
 
 local CurrentGameState = ReplicatedStorage:WaitForChild("CurrentGameState")
 local RoleAssigned = ReplicatedStorage:WaitForChild("RoleAssigned")
@@ -9,6 +10,7 @@ local ExecutionPrompt = ReplicatedStorage:WaitForChild("ExecutionPrompt")
 local AliveStatusUpdate = ReplicatedStorage:WaitForChild("AliveStatusUpdate")
 local RoomPartnerSync = ReplicatedStorage:WaitForChild("RoomPartnerSync")
 local GossipPing = ReplicatedStorage:WaitForChild("GossipPing")
+local GameOverReveal = ReplicatedStorage:WaitForChild("GameOverReveal")
 
 local SharedState = require(ReplicatedStorage.Shared.GameState)
 local GameState = SharedState.GameState
@@ -16,6 +18,9 @@ local PlayerData = SharedState.PlayerData
 local PendingActions = GameState.PendingActions
 
 local Tribunal = require(ReplicatedStorage.Shared.Tribunal)
+local EconomyManager = require(script.Parent.EconomyManager)
+
+local HUB_PLACE_ID = 104433635710806
 
 local ALIVE_COLLISION_GROUP = "Alive"
 local GHOST_COLLISION_GROUP = "Ghosts"
@@ -118,6 +123,80 @@ local function tickCooldowns()
 			data.Cooldown -= 1
 		end
 	end
+end
+
+local function evaluateWinConditions(): (string?, boolean)
+	local isRevolutionaryAlive = false
+	local isUsurperAlive = false
+	local isKingAlive = false
+	local isDoubleAlive = false
+	local isPrinceAlive = false
+	local hasCrownedUsurperExisted = false
+	local isCrownedUsurperAlive = false
+
+	local aliveCount = 0
+	local totalPlayers = 0
+
+	for _, player in Players:GetPlayers() do
+		totalPlayers += 1
+		local data = PlayerData[player.UserId]
+		if not data then
+			continue
+		end
+
+		if data.IsAlive == true then
+			aliveCount += 1
+		end
+
+		if data.Role == "Revolutionary" and data.IsAlive == true then
+			isRevolutionaryAlive = true
+		elseif data.Role == "Usurper" and data.IsAlive == true then
+			isUsurperAlive = true
+		elseif data.Role == "King" and data.IsAlive == true then
+			isKingAlive = true
+		elseif data.Role == "Double" and data.IsAlive == true then
+			isDoubleAlive = true
+		elseif data.Role == "Prince" and data.IsAlive == true then
+			isPrinceAlive = true
+		end
+
+		-- HasCrown persists on a dead Usurper's data if no living heir ever inherited it (see
+		-- handleRoyalSuccession in ActionHandler.server.luau), so this still fires post-mortem.
+		if data.Role == "Usurper" and data.HasCrown == true then
+			hasCrownedUsurperExisted = true
+			if data.IsAlive == true then
+				isCrownedUsurperAlive = true
+			end
+		end
+	end
+
+	-- Royal Win: both rebel threats (Revolutionary + Usurper) eliminated
+	if not isRevolutionaryAlive and not isUsurperAlive then
+		return "The Crown", false
+	end
+
+	-- Rebel Win: the entire royal line, including a crowned Usurper impostor, is wiped out
+	if not isKingAlive and not isDoubleAlive and not isPrinceAlive and hasCrownedUsurperExisted and not isCrownedUsurperAlive then
+		return "The Uprising", false
+	end
+
+	-- Pacifist Win: Day 6 closes out with nobody dead
+	if GameState.CurrentDay == 6 and totalPlayers > 0 and aliveCount == totalPlayers then
+		return "Everyone", true
+	end
+
+	return nil, false
+end
+
+local function buildFinalRoles(): { [string]: string }
+	local finalRoles = {}
+	for _, player in Players:GetPlayers() do
+		local data = PlayerData[player.UserId]
+		if data then
+			finalRoles[player.Name] = data.Role
+		end
+	end
+	return finalRoles
 end
 
 local function assignRoles()
@@ -498,9 +577,39 @@ while true do
 		teleportPlayersTo(Workspace.PrivateQuarters.SpawnPoint_Private)
 		notifyExecutioners()
 	elseif GameState.CurrentState == "NightPhase" then
-		if GameState.CurrentDay == 6 then
+		local winningFaction, wasPacifist = evaluateWinConditions()
+
+		if winningFaction then
 			GameState.CurrentState = "GameOver"
 			updateGameStateDisplay()
+
+			EconomyManager:DistributeMatchRewards(winningFaction, wasPacifist, GameState.MatchStats)
+
+			print("================================================")
+			print("  GAME OVER -- " .. winningFaction .. " WINS" .. (wasPacifist and " (PACIFIST)" or ""))
+			print("================================================")
+
+			GameOverReveal:FireAllClients(winningFaction, wasPacifist, buildFinalRoles())
+
+			task.wait(15)
+			TeleportService:TeleportAsync(HUB_PLACE_ID, Players:GetPlayers())
+
+			break
+		elseif GameState.CurrentDay == 6 then
+			GameState.CurrentState = "GameOver"
+			updateGameStateDisplay()
+
+			EconomyManager:DistributeMatchRewards("None", false, GameState.MatchStats)
+
+			print("================================================")
+			print("  GAME OVER -- DAY 6 REACHED, NO FACTION ELIMINATED")
+			print("================================================")
+
+			GameOverReveal:FireAllClients("None", false, buildFinalRoles())
+
+			task.wait(15)
+			TeleportService:TeleportAsync(HUB_PLACE_ID, Players:GetPlayers())
+
 			break
 		else
 			table.clear(PendingActions)

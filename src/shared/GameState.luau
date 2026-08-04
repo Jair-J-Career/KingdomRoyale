@@ -7,6 +7,7 @@ local GameState = {
 	SpyTarget = nil,
 	PeasantVotes = {},
 	LastTribunalDay = 0,
+	MatchStats = {},
 }
 
 local PlayerData = {}

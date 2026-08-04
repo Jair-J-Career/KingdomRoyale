@@ -14,10 +14,26 @@ local Tribunal = {}
 -- via an early majority or an Evening Gathering timeout tie-break.
 function Tribunal.Execute(targetPlayer: Player)
 	GameState.LastTribunalDay = GameState.CurrentDay
-	table.clear(GameState.PeasantVotes)
 
 	local targetData = PlayerData[targetPlayer.UserId]
-	if targetData and targetData.Role == "King" then
+	local targetIsKing = targetData ~= nil and targetData.Role == "King"
+
+	if targetIsKing then
+		for voterUserId, votedUserId in GameState.PeasantVotes do
+			if votedUserId == targetPlayer.UserId then
+				local voterStats = GameState.MatchStats[voterUserId]
+				if not voterStats then
+					voterStats = {}
+					GameState.MatchStats[voterUserId] = voterStats
+				end
+				voterStats.VotedKingCorrectly = true
+			end
+		end
+	end
+
+	table.clear(GameState.PeasantVotes)
+
+	if targetIsKing then
 		TribunalResult:FireAllClients("THE MOB HAS EXPOSED " .. targetPlayer.Name:upper() .. " AS THE KING!", true)
 	else
 		TribunalResult:FireAllClients(

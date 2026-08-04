@@ -17,6 +17,7 @@ local RoleRevealed = ReplicatedStorage:WaitForChild("RoleRevealed")
 local GossipPing = ReplicatedStorage:WaitForChild("GossipPing")
 local TribunalResult = ReplicatedStorage:WaitForChild("TribunalResult")
 local CrownInherited = ReplicatedStorage:WaitForChild("CrownInherited")
+local GameOverReveal = ReplicatedStorage:WaitForChild("GameOverReveal")
 
 local localPlayer = Players.LocalPlayer
 local playerGui = localPlayer:WaitForChild("PlayerGui")
@@ -788,6 +789,89 @@ CrownInherited.OnClientEvent:Connect(function()
 	)
 
 	renderUI()
+end)
+
+local function formatFinalRoles(finalRoles: { [string]: string }): { string }
+	local names = {}
+	for name in finalRoles do
+		table.insert(names, name)
+	end
+	table.sort(names)
+	return names
+end
+
+GameOverReveal.OnClientEvent:Connect(function(winningFaction: string, wasPacifist: boolean, finalRoles: { [string]: string })
+	activeMenu = "None"
+	renderUI()
+
+	local existing = actionUI:FindFirstChild("GameOverReveal")
+	if existing then
+		existing:Destroy()
+	end
+
+	local titleText = (winningFaction == "None") and "DRAW -- OUT OF TIME" or (winningFaction:upper() .. " WINS!")
+	if wasPacifist then
+		titleText ..= " (PACIFIST)"
+	end
+
+	local container = Instance.new("Frame")
+	container.Name = "GameOverReveal"
+	container.Size = UDim2.new(0.5, 0, 0.6, 0)
+	container.Position = UDim2.new(0.25, 0, 0.2, 0)
+	container.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+	container.BackgroundTransparency = 0.1
+	container.BorderSizePixel = 0
+	container.Parent = actionUI
+
+	local title = Instance.new("TextLabel")
+	title.Name = "Title"
+	title.Size = UDim2.new(1, 0, 0.2, 0)
+	title.BackgroundTransparency = 1
+	title.Font = Enum.Font.SourceSansBold
+	title.TextScaled = true
+	title.TextColor3 = BANNER_GOLD_COLOR
+	title.Text = titleText
+	title.Parent = container
+
+	local roster = Instance.new("ScrollingFrame")
+	roster.Name = "Roster"
+	roster.Size = UDim2.new(1, 0, 0.8, 0)
+	roster.Position = UDim2.new(0, 0, 0.2, 0)
+	roster.BackgroundTransparency = 1
+	roster.BorderSizePixel = 0
+	roster.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	roster.CanvasSize = UDim2.new(0, 0, 0, 0)
+	roster.ScrollBarThickness = 6
+	roster.Parent = container
+
+	local layout = Instance.new("UIListLayout")
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = roster
+
+	local names = formatFinalRoles(finalRoles)
+
+	print("================ GAME OVER ================")
+	print(titleText)
+
+	for _, name in names do
+		local line = Instance.new("TextLabel")
+		line.Name = name
+		line.Size = UDim2.new(1, 0, 0, 40)
+		line.BackgroundTransparency = 1
+		line.Font = Enum.Font.SourceSans
+		line.TextScaled = true
+		line.TextColor3 = TEXT_COLOR
+		line.Text = name .. " was the " .. finalRoles[name]
+		line.Parent = roster
+
+		print(name .. " was the " .. finalRoles[name])
+	end
+
+	print("=============================================")
+
+	task.delay(15, function()
+		container:Destroy()
+	end)
 end)
 
 updateVisibility()

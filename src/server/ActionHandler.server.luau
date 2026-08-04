@@ -99,6 +99,16 @@ local function redirectToMartyr(martyrPlayer: Player, attackerPlayer: Player, or
 		martyrData.IsAlive = false
 	end
 
+	local originalTargetData = PlayerData[originalTargetPlayer.UserId]
+	if originalTargetData and originalTargetData.Role == "King" then
+		local martyrStats = GameState.MatchStats[martyrPlayer.UserId]
+		if not martyrStats then
+			martyrStats = {}
+			GameState.MatchStats[martyrPlayer.UserId] = martyrStats
+		end
+		martyrStats.InterceptedKingHit = true
+	end
+
 	StrikeIntercepted:FireClient(attackerPlayer, martyrPlayer.Name, originalTargetPlayer.Name)
 
 	print(martyrPlayer.Name .. " (Martyr) sacrificed themselves to save " .. originalTargetPlayer.Name)
@@ -461,6 +471,14 @@ local function handleConfirmExecution(player: Player, targetName: string)
 	if targetData then
 		targetData.IsAlive = false
 	end
+
+	-- requesterData.Role is guaranteed to be "Sorcerer" or "Knight" here (checked above)
+	local killerStats = GameState.MatchStats[player.UserId]
+	if not killerStats then
+		killerStats = {}
+		GameState.MatchStats[player.UserId] = killerStats
+	end
+	killerStats.Kills = (killerStats.Kills or 0) + 1
 
 	handleRoyalSuccession(targetPlayer.UserId)
 

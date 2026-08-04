@@ -54,6 +54,9 @@
       },
       "CrownInherited": {
         "$className": "RemoteEvent"
+      },
+      "GameOverReveal": {
+        "$className": "RemoteEvent"
       }
     },
 
